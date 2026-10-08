@@ -9,6 +9,6 @@ cc -O2 -g -Wall -Wextra -fPIC -shared -fvisibility=hidden -o "$here/build/libhea
 echo "built $here/build/libheaptide.so"
 mojo=${MOJO:-$(command -v mojo || ls "$here/.venv/bin/mojo" 2>/dev/null || true)}
 [[ -n $mojo ]] || { echo "FAIL build: no mojo toolchain (put mojo on PATH, in ./.venv, or set MOJO=)" >&2; exit 1; }
-"$mojo" build -O3 "$here/report/heaptide_report.mojo" -o "$here/build/heaptide_report" 2>&1 | grep -vE "posix_spawn|Crashpad|spawn_subprocess|Please submit|Stack dump|Program arguments|^ *#|^\s*$" >&2 || true
+"$mojo" build -O3 "$here/report/heaptide_report.mojo" -o "$here/build/heaptide_report" 2>&1 | grep -vE "posix_spawn|Crashpad|spawn_subprocess|Please submit|Stack dump|Program arguments|^ *#|^[0-9]+ +[^ ]+ +0x|^\s*$" >&2 || true
 [[ -x "$here/build/heaptide_report" ]] || { echo "FAIL build: heaptide_report" >&2; exit 1; }
 echo "built $here/build/heaptide_report"

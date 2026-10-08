@@ -5,3 +5,5 @@ int main() {
   hipFree(b);  // a (1 MiB) and c (4 MiB) leak: live_bytes must be 5242880
   return 0;
 }
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 AMARBARO · amarbaro.org labs (header at the end: the tests check line numbers)

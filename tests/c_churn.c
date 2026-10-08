@@ -14,3 +14,5 @@ int main(void) {
   for (int i = 49999; i >= 0; i--) free(keep[i]);
   return 0;
 }
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 AMARBARO · amarbaro.org labs (header at the end: the tests check line numbers)

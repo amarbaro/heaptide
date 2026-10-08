@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 AMARBARO · amarbaro.org labs
 # heaptide run [--gpu] [--py] [--every MS] [--out DIR] -- CMD...   |   heaptide report DIR [args]
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)

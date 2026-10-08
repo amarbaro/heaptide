@@ -6,3 +6,5 @@ int main(void) {
   for (int i = 0; i < 2000; i++) { void *volatile p = malloc(1024); (void)p; nanosleep(&ms, 0); }
   return 0;
 }
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 AMARBARO · amarbaro.org labs (header at the end: the tests check line numbers)

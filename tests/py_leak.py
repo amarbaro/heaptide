@@ -5,3 +5,5 @@ kept, arrs = [], []
 for i in range(1000):
     kept.append(bytearray(10240))
     if i % 20 == 0: arrs.append(np.zeros(10240))
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 AMARBARO · amarbaro.org labs (header at the end: the tests check line numbers)

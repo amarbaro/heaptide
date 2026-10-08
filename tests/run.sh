@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 AMARBARO · amarbaro.org labs
 # All heaptide checks; heaptrack and LSan are the oracles. GPU checks need ROCm (hipcc) and mojo;
 # they run through gpu-wait when it is installed. GPU_ARCH overrides the target (default: first
 # gfx* from rocminfo). --cpu runs the CPU checks only and says so on the last line (for machines

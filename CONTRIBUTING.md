@@ -26,4 +26,7 @@ Security problems go through private reporting instead, see [SECURITY.md](SECURI
 Keep pull requests to one concern. Match the style of the file you edit; new files carry the
 SPDX header.
 
-By contributing you agree your work is licensed under Apache-2.0, the project's license.
+Sign off every commit (`git commit -s`): the `Signed-off-by` line certifies the
+[Developer Certificate of Origin](https://developercertificate.org/), and your work is licensed
+under Apache-2.0, the project's license. Run `tools/publish-check.sh` before opening the pull
+request. Participation follows the [Code of Conduct](CODE_OF_CONDUCT.md).

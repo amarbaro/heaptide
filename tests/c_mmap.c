@@ -22,3 +22,5 @@ int main(void) {
   lose();
   return 0;
 }
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 AMARBARO · amarbaro.org labs (header at the end: the tests check line numbers)

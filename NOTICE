@@ -1,0 +1,6 @@
+heaptide
+Copyright 2026 AMARBARO · amarbaro.org labs
+
+This product includes software developed at AMARBARO (https://amarbaro.org).
+The reachability scan follows the design of LLVM LeakSanitizer (Apache-2.0 WITH LLVM-exception);
+no LeakSanitizer source code is included.

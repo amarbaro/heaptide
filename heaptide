@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# heaptide run [--gpu] [--py] [--every MS] [--out DIR] -- CMD...   |   heaptide report DIR [args]
+set -euo pipefail
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+case "${1:-}" in
+  report) shift; exec "$here/build/heaptide_report" "$@" ;;
+  run) shift ;;
+  *) echo "usage: heaptide run [--gpu] [--py] [--every MS] [--out DIR] -- CMD... | heaptide report DIR [--json] [--top N]" >&2; exit 2 ;;
+esac
+out=.work/heaptide; py=0
+while [[ $# -gt 0 && $1 != -- ]]; do
+  case $1 in
+    --gpu) export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE=0 MODULAR_DEVICE_CONTEXT_HOST_MEMORY_MANAGER_SIZE=0 ;;
+    --py) py=1 ;;
+    --every) export HEAPTIDE_EVERY=$2; shift ;;
+    --out) out=$2; shift ;;
+    *) echo "FAIL heaptide: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[[ ${1:-} == -- ]] && shift
+[[ $# -gt 0 ]] || { echo "FAIL heaptide: no command" >&2; exit 2; }
+mkdir -p "$out"; export HEAPTIDE_OUT=$(readlink -f "$out")
+if (( py )); then
+  [[ $(basename "$1") == python* ]] || { echo "FAIL heaptide: --py needs a python command" >&2; exit 2; }
+  export HEAPTIDE_DEPTH=${HEAPTIDE_DEPTH:-8}  # tracemalloc gives the Python lines; native frames past 8 only split sites
+  exe=$1; shift; set -- "$exe" -X tracemalloc=1 "$here/py/run.py" "$@"
+fi
+rc=0; LD_PRELOAD="$here/build/libheaptide.so${LD_PRELOAD:+:$LD_PRELOAD}" "$@" || rc=$?
+echo "heaptide: report with: heaptide report $HEAPTIDE_OUT" >&2
+exit $rc

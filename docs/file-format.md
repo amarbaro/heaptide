@@ -1,6 +1,6 @@
 # File format
 
-The shim writes two files per process into `HEAPTIDE_OUT` (default `.work/heaptide`) at exit:
+The shim writes two files per process into `HEAPTIDE_OUT` (default `.work/heaptide`) at exit, on a stop signal, and at each snapshot (latest wins; each file is written as `.tmp` and renamed, the `.maps` first, so a reader never sees half a file):
 
 - `heaptide.<pid>.bin`: the data below, little-endian
 - `heaptide.<pid>.maps`: a copy of `/proc/self/maps`, used to symbolize addresses
@@ -17,6 +17,7 @@ With `--py`, `py.<pid>.txt` adds the PYTHON section as text.
 | ... | 8 × `n` | direct leaked bytes per stack |
 | ... | 8 × `n` | indirect leaked bytes per stack |
 | ... | 24 × `nsamples` | live-byte samples |
+| ... | 8 × `n` | leaked blocks per stack (only when header field 6 has bit 0 set) |
 
 Header (u64 each):
 
@@ -28,7 +29,8 @@ Header (u64 each):
 | 3 | `nips`, number of instruction pointers |
 | 4 | `nsamples` |
 | 5 | sampling period in ms |
-| 6, 7 | 0 |
+| 6 | flags: bit 0 = leaked block counts follow the samples (since v0.1.2; older files: the report shows live blocks) |
+| 7 | 0 |
 
 Row (56 B, `row_t` in `shim/heaptide.c`, size fixed by a static assert):
 
@@ -50,3 +52,7 @@ Sample (24 B): u64 monotonic time in ns, u64 live bytes of cpu + host + mmap, u6
 IPs are return addresses. To symbolize one, find its mapping in the `.maps` file and subtract
 the mapping's lowest start minus one (the address of the call instruction). The report sends all
 of them to `llvm-symbolizer` in one batch per process.
+
+The report checks a file before reading it: counts below the shim's limits (2^25 stacks, 2^31
+frames, 2^21 samples), a file long enough for every section they promise, and every stack's
+frames inside the frame array. Anything else is exit 2.

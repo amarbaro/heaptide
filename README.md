@@ -3,13 +3,14 @@
 [![cpu](https://github.com/amarbaro/heaptide/actions/workflows/cpu.yml/badge.svg)](https://github.com/amarbaro/heaptide/actions/workflows/cpu.yml)
 
 heaptide finds leaks in CPU, GPU (HIP and Mojo) and Python programs in one pass, without
-rebuilding them. On an 8-thread malloc benchmark it runs 4.1x faster than heaptrack with 6.5x less
+rebuilding them. On an 8-thread malloc benchmark it runs 12x faster than heaptrack with 6.7x less
 added memory. On every planted leak in its test suite, its direct/indirect split matches
 LeakSanitizer's. It also sees HIP device and pinned host memory, Mojo's GPU buffers included,
 which no other leak tool we know of covers on ROCm.
 
 ```
-heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--out DIR] -- CMD...      default DIR .work/heaptide
+heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--out DIR] -- CMD...
+heaptide snapshot DIR                                  a running process writes its report now
 heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none]
                     [--growth-limit MIB]
 ```
@@ -89,9 +90,20 @@ GPU targets need ROCm/HIP. Python mode uses the standard library's `tracemalloc`
   stacks are capped at 8 frames (`HEAPTIDE_DEPTH`, default 64), because most Python-mode stacks
   are tracemalloc's own and deeper frames only split them.
 - `--every MS` sets the GROWTH sampling period (default 100).
+- Long-running processes: SIGTERM, SIGINT and SIGHUP write the report before the process dies of
+  the signal (exit status unchanged), unless the program installed its own handler, which is left
+  alone (with `--py`, the PYTHON section is written too). `heaptide snapshot DIR` makes a running
+  process write its report now, and
+  `--snapshot-every S` does it on a timer; `heaptide report DIR` then shows the latest one. A
+  snapshot pauses the program only to fork it (10M live blocks: 15 ms) and scans the copy, which
+  can cost up to the heap's size in memory while the program rewrites its pages; it is skipped if
+  a thread cannot be parked.
+- A crash (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT) writes the report, then the process dies of
+  the signal; best effort, since the heap may be broken (it gives up after 10 s).
 - `report --growth-limit MIB` fails GROWTH on a projected rise above MIB, whatever the mean.
-- `report --supp FILE` drops leaks whose site contains any line of FILE. `--json` prints one
-  object per process.
+- `report --supp FILE` drops leaks whose site contains any line of FILE (built in: glibc's
+  `_dlerror_run` buffer, which libc releases at exit behind malloc's back). `--json` prints one
+  object per process. A damaged `.bin`, a missing option value or an unknown option is exit 2.
 - Exit code: 0 clean, 1 leak or growth (per `--fail-on`), 2 tool error.
 
 Child processes are traced too. A helper with a peak under 1 MiB, leaks under 64 KiB and no
@@ -132,18 +144,19 @@ heaptide report (Mojo) ── one llvm-symbolizer batch ──► LEAKS · GROWT
 
 heaptrack streams every event to a second process; heaptide keeps one counter row per call stack
 and one 16 B entry per live block, and writes a single file at exit. Threads never share a hot
-counter: live totals are per thread, and each thread batches its updates to a call site's row.
+counter or lock: live totals are per thread, each thread batches its updates to a call site's row,
+and each thread remembers its last 64 call stacks' ids, so a known site skips the shared table.
 `bench/alloc_bench.c` (8 threads × 1M malloc/free, 16..4096 B), `/usr/bin/time -f "%e s %M KB"`,
 Ryzen 7 7800X3D, arms interleaved over 8 rounds:
 
 | arm | wall | peak RSS | RSS over bare |
 |---|---|---|---|
-| bare | 0.01-0.02 s | 3.1 MB | |
-| heaptrack 1.5.0 `--record-only` | 1.53-1.67 s (median 1.56) | 65.1 MB | +62.0 MB |
-| heaptide | 0.31-0.44 s (median 0.38) | 12.6 MB | +9.5 MB |
+| bare | 0.02 s | 3.2 MB | |
+| heaptrack 1.5.0 `--record-only` | 1.60-1.82 s (median 1.65) | 65.3 MB | +62.1 MB |
+| heaptide | 0.12-0.14 s (median 0.13) | 12.5 MB | +9.3 MB |
 
-That is still about 25x slower than no tool on an allocation-bound loop, and heaptide's time
-varies more from run to run than heaptrack's. Python mode costs more: 1.1 s
+That is still about 6x slower than no tool on an allocation-bound loop (load average 3 during the
+runs). Python mode costs more: 1.1 s
 for a script that runs in 0.06 s bare, nearly all of it in `tracemalloc`.
 
 Internals: [docs/how-it-works.md](docs/how-it-works.md). File format:
@@ -151,10 +164,10 @@ Internals: [docs/how-it-works.md](docs/how-it-works.md). File format:
 
 ## Every claim above has a check
 
-`tests/run.sh` runs 60 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
+`tests/run.sh` runs 112 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
 exact leak bytes, file:line, the direct/indirect split, mmap regions, blocks held only by a
 thread's stack or register, interior pointers, fork, reserve-then-commit mappings, growth after a
-long setup, Python lines, and HIP and Mojo GPU leaks. `tests/run.sh --cpu` runs the 56 that need
+long setup, Python lines, and HIP and Mojo GPU leaks. `tests/run.sh --cpu` runs the 108 that need
 no GPU; CI runs those on Ubuntu 24.04 for every push.
 [docs/testing.md](docs/testing.md) lists them.
 
@@ -175,12 +188,14 @@ directory (for Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/
 - GPU and pinned host blocks are never scanned for pointers, because the HIP runtime's own
   tables point at all of them. Any GPU or host block unfreed at exit counts as a direct leak.
 - A `PROT_NONE` reservation counts only the parts `mprotect` commits, each as a block at the
-  `mprotect` call; `mprotect(PROT_NONE)` and `madvise(MADV_DONTNEED|MADV_FREE)` decommit. Pages
-  touched again after such a `madvise` without a new `mprotect` are not seen, nor a reservation
-  moved with `mremap`.
+  `mprotect` call; `mprotect(PROT_NONE)` decommits. After `madvise(MADV_DONTNEED|MADV_FREE)`
+  only the pages resident at report time count. A reservation moved with `mremap` is followed.
+- SIGKILL (and the OOM killer) writes no report: use `--snapshot-every` on anything that may die
+  that way. A stack overflow writes a report only in the main thread or a thread that has
+  allocated (each gets a 64 KiB signal stack, mapped but untouched until a crash).
 - A forked child treats the parent's blocks as reachable roots, so it reports only its own leaks
-  (LeakSanitizer reports the parent's again in the child). Two stacks whose 64-bit hashes collide
-  merge into one site.
+  (LeakSanitizer reports the parent's again in the child). Stack ids are a 64-bit hash plus a
+  32-bit check: two sites merge only if all 96 bits collide.
 - Stripped system libraries show as `[module]` frames unless their debug file is in elfutils'
   cache or `DEBUGINFOD_URLS` is set (then fetched once by build-id; libpython is 33 MB).
 - Linux x86-64 only. GPU paths tested on one machine (Arch Linux, kernel 7.2, glibc 2.44,

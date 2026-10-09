@@ -7,6 +7,7 @@ int main(void) {
   mprotect(commit(r + (8 << 20)), 1 << 20, PROT_NONE);  // committed, then decommitted
   commit(r + (12 << 20));                     // lost
   madvise(commit(r + (14 << 20)), 1 << 20, MADV_DONTNEED);  // committed, then returned
+  char *q = commit(r + (10 << 20)); madvise(q, 1 << 20, MADV_DONTNEED); q[4096] = 1; q = 0;  // returned, reused by a write, lost
   r = 0;
   return 0;
 }

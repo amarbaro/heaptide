@@ -1,14 +1,15 @@
 # Testing
 
-`tests/run.sh` builds everything and runs 60 checks against programs with planted bugs. Where a
+`tests/run.sh` builds everything and runs 112 checks against programs with planted bugs. Where a
 standard tool can answer the same question, its answer is the oracle: heaptrack for leaked
 allocation counts, LeakSanitizer (`clang -fsanitize=leak`) for the direct/indirect split and
 reachability. The script prints `PASS N/N`, or `FAIL k/N <names>` and exits non-zero.
 
 ```
-tests/run.sh                    # everything, GPU included: PASS 60/60
-tests/run.sh --cpu              # CPU checks only: PASS 56/56 (cpu only: GPU checks not run)
+tests/run.sh                    # everything, GPU included: PASS 112/112
+tests/run.sh --cpu              # CPU checks only: PASS 108/108 (cpu only: GPU checks not run)
 HEAPTIDE_NO_GPU=1 tests/run.sh  # GPU checks skipped and counted as FAIL
+taskset -c 0 tests/run.sh --cpu # one CPU: the signal and snapshot checks poll, never sleep-guess
 GPU_ARCH=gfx90a tests/run.sh    # override the GPU target (default: first gfx* from rocminfo)
 ```
 
@@ -17,7 +18,7 @@ Mojo; the GPU part also needs ROCm (`hipcc`). When `gpu-wait` is installed, GPU 
 through it.
 
 `.github/workflows/cpu.yml` runs `tests/run.sh --cpu` on ubuntu-24.04 for every push and pull
-request. The same steps pass in an `ubuntu:24.04` container (55/55: the debuginfod check runs only
+request. The same steps pass in an `ubuntu:24.04` container (69/69: the debuginfod check runs only
 when `DEBUGINFOD_URLS` is set). Container runs found the Ubuntu-only stale-slot bug in the exiting
 thread's stack scan and a GCC 13 build break. Before a release, the tarball also runs on a second,
 older CPU (it caught a report built for the build machine's CPU) and under WSL2 on Windows.
@@ -40,10 +41,19 @@ older CPU (it caught a report built for the build machine's CPU) and under WSL2 
 | `c_peak.c` | one allocation still in its thread's batch at exit | PEAK 12345 at `c_peak.c:3` |
 | `c_dlhang.c` | a thread inside `dl_iterate_phdr` at exit | run exits 0 (deadlocked before) |
 | generated `many.c` | 1001 leaking sites | report direct 1001 (1000 before) |
-| `c_reserve.c` | 16 MiB PROT_NONE reservation: one chunk committed and kept, one committed then decommitted, one committed and lost, one committed then returned with `madvise` | live mmap 2097152, direct 1048576 at `c_reserve.c:3` |
+| `c_reserve.c` | 16 MiB PROT_NONE reservation: one chunk committed and kept, one committed then decommitted, one committed and lost, one committed then returned with `madvise`, one returned then reused by a write | live mmap 2097152, direct 1052672 (1 MiB + the reused page) at `c_reserve.c:3` |
 | `c_next.c` | `dlsym(RTLD_NEXT, "malloc")` from the program, 4096 B lost through it | direct 4096 (0 when the hook is not a tail call) |
+| `c_signal.c` | a lost block, then SIGTERM / SIGINT; once with its own SIGTERM handler | report written, exit 143 / 130, direct 4096; own handler: exit 7 |
+| `c_crash.c` | a lost block, then a NULL write / `abort()` / a stack overflow in a second thread; once with its own SIGSEGV handler | report written, exit 139 / 134 / 139, direct 4096; own handler: exit 9 |
+| `c_edge.c` | `realloc(p, 0)` (small and mmap-backed), `reallocarray` overflow, `dlsym("hipMalloc")` without HIP, 1 of 2 blocks lost, a reservation's middle page moved and grown, `mremap` over another mapping, a thread's pending updates at the peak, `ulimit -v 1G`, a path with a space | direct 0 / 0, errno 12, NULL, 1 leaked block, live_mmap 8192 / 8192, worker's 258048 B in PEAK, exit 0 with direct 64, source line shown |
+| `hip_mock.c` | fake `libamdhip64` whose `hipFree` fails | the block stays live (live_gpu 4096) |
+| report inputs | truncated `.bin`, impossible counts, `--top` without value, unknown flag, negative `--growth-limit`, a module path with `\\` and `"` | exit 2 each; `--json` parses |
+| `c_snapshot.c` | loses 1 KiB every 50 ms for 2 s | `heaptide snapshot` at 1 s: 0 < direct < 40960; final 40960; the snapshot's block count = direct / 1024 (batched counters flushed); `--snapshot-every` writes >= 2; with `prlimit --nproc=1` (no fork) the in-place snapshot still works and final stays 40960 |
+| `c_remap.c` | a reservation grown and moved with `mremap`, then committed | live mmap 2097152, direct 1048576 |
+| generated `c20.c` | 20 leaking sites under a shim with a 4-bit stack hash | same site count as the normal shim (19; 8 without the check hash) |
 | `c_fork.c` | parent and child each lose a block; the child links a block only from a parent block | child direct 32, parent direct 64 (LSan reports 96 in the child: deliberate) |
 | `py_leak.py` | Python objects and numpy buffers kept alive | PYTHON lines 6 and 7; numpy's native frames; output file < 8 MB |
+| `py_hold.py` | holds 8 MiB at line 2, sleeps | `heaptide snapshot`: PYTHON section written while running; SIGTERM: exit 143 and `py_hold.py:2`; SIGTERM during startup: exit 143 and a PYTHON section |
 | `py_deep.py` | a leak two Python calls deep, `--py-depth 2` | PYTHON site `py_deep.py:4 <- py_deep.py:6` |
 | `hip_leak.hip` | 5 MiB of `hipMalloc` never freed | live GPU 5242880 at `hip_leak.hip:4` |
 | `mojo_leak.mojo` | a 4 MiB device buffer leaked | live GPU 4194304 at `mojo_leak.mojo:8` |
@@ -61,6 +71,7 @@ Two paths were also tested by removing them, to show the check can fail:
 
 `bench/alloc_bench.c` (8 threads × 1M malloc/free) measures overhead; see the README.
 `bench/scan_bench.c` is the exit scan's worst case (1M blocks, every word an interior pointer).
+`bench/snap_pause.c` holds 1M live blocks (argument: count) and prints the longest stall it saw; run it under `heaptide run`, call `heaptide snapshot` meanwhile.
 `bench/reserve_bench.c` commits and decommits 64 KiB of a 1 GiB reservation 16k times. Measure
 the arms interleaved in one sitting at low load. Numbers taken at different load levels do not
 compare.

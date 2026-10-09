@@ -26,6 +26,11 @@ JSON, not the text: it is the stable interface.
      one helper is called from many places: PYTHON then shows each call chain, not one line.
    - Short runs need a faster sampler or GROWTH says `too short`: `--every 20` under a few
      seconds, `--every 1` under one second.
+   - Servers and long jobs: stop them with SIGTERM or Ctrl-C (the report is still written), or
+     leave them running and call `heaptide snapshot .work/ht`, then `heaptide report`. Two
+     snapshots under the same load show what grew between them (a snapshot pauses the program
+     for milliseconds). A crash writes the report too; SIGKILL and the OOM killer write
+     nothing: add `--snapshot-every 60`.
 3. **Read** `report.json`: one object per process. Children are traced too; the target is
    usually the object with the most leak sites.
    ```

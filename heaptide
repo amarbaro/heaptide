@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 AMARBARO · amarbaro.org labs
-# heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--out DIR] -- CMD...   |   heaptide report DIR [args]
+# heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--out DIR] -- CMD...
+# heaptide report DIR [args]   |   heaptide snapshot DIR (running process writes a report now)
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 case "${1:-}" in
   report) shift; exec "$here/build/heaptide_report" "$@" ;;
+  snapshot) [[ -d ${2:-} ]] || { echo "FAIL heaptide: snapshot needs the run's --out DIR" >&2; exit 2; }
+            : > "$2/snapshot"; echo "heaptide: snapshot requested; the process writes it within --every ms" >&2; exit 0 ;;
   run) shift ;;
-  *) echo "usage: heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--out DIR] -- CMD... | heaptide report DIR [--json] [--top N]" >&2; exit 2 ;;
+  *) echo "usage: heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--out DIR] -- CMD... | heaptide report DIR [--json] [--top N] | heaptide snapshot DIR" >&2; exit 2 ;;
 esac
 out=.work/heaptide; py=0; pyd=1
 while [[ $# -gt 0 && $1 != -- ]]; do
+  case $1 in --py-depth|--every|--snapshot-every|--out)
+    [[ $# -ge 2 && $2 != -- && $2 != --* ]] || { echo "FAIL heaptide: $1 needs a value" >&2; exit 2; }
+    [[ $1 == --out || $2 =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "FAIL heaptide: $1 takes a number, not $2" >&2; exit 2; } ;;
+  esac
   case $1 in
     --gpu) export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE=0 MODULAR_DEVICE_CONTEXT_HOST_MEMORY_MANAGER_SIZE=0 ;;
     --py) py=1 ;;
     --py-depth) pyd=$2; shift ;;
     --every) export HEAPTIDE_EVERY=$2; shift ;;
+    --snapshot-every) export HEAPTIDE_SNAPSHOT_EVERY=$2; shift ;;
     --out) out=$2; shift ;;
     *) echo "FAIL heaptide: unknown option $1" >&2; exit 2 ;;
   esac
@@ -25,6 +33,7 @@ done
 [[ $# -gt 0 ]] || { echo "FAIL heaptide: no command" >&2; exit 2; }
 mkdir -p "$out"; export HEAPTIDE_OUT=$(readlink -f "$out")
 if (( py )); then
+  export HEAPTIDE_PY=1
   [[ $(basename "$1") == python* ]] || { echo "FAIL heaptide: --py needs a python command" >&2; exit 2; }
   export HEAPTIDE_DEPTH=${HEAPTIDE_DEPTH:-8}  # tracemalloc gives the Python lines; native frames past 8 only split sites
   exe=$1; shift; set -- "$exe" -X tracemalloc=$pyd "$here/py/run.py" "$@"

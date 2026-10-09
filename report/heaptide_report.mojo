@@ -14,12 +14,12 @@ comptime FIND_SYMBOLIZER = "S=${HEAPTIDE_SYMBOLIZER:-$(command -v llvm-symbolize
 # Stripped modules: swap in the debug file from elfutils' cache (shared with gdb), fetched by
 # build-id from $DEBUGINFOD_URLS when missing. Reads the request file $I in place.
 comptime DEBUGINFOD = """c=${XDG_CACHE_HOME:-$HOME/.cache}/debuginfod_client
-for m in $(cut -d' ' -f1 "$I" | sort -u); do
+cut -d'"' -f2 "$I" | sort -u | while IFS= read -r m; do
   readelf -S "$m" 2>/dev/null | grep -q debug_info && continue
   id=$(readelf -n "$m" 2>/dev/null | awk '/Build ID/{print $3}'); [ -n "$id" ] || continue
   d=$c/$id/debuginfo
   [ -s "$d" ] || [ -z "${DEBUGINFOD_URLS:-}" ] || { mkdir -p "$c/$id" && curl -sfL --max-time 120 "${DEBUGINFOD_URLS%% *}/buildid/$id/debuginfo" -o "$d.tmp" && mv "$d.tmp" "$d" || echo "note: debuginfod has no debug file for $m" >&2; }
-  [ -s "$d" ] && sed -i "s|^$m |$d |" "$I"
+  [ -s "$d" ] && sed -i "s|^\\"$m\\" |\\"$d\\" |" "$I"
 done
 """
 
@@ -52,6 +52,7 @@ struct Stack(Copyable, Movable):
     var peak_b: UInt64
     var direct: UInt64
     var indirect: UInt64
+    var leaked_n: UInt64  # leaked blocks (files from before v0.1.2: all live blocks)
     var kind: Int
     var ips: List[UInt64]
 
@@ -79,12 +80,13 @@ def load_maps(path: String) raises -> List[Mapping]:
         text = f.read()
     for line in text.split("\n"):
         var parts = line.split()
-        if len(parts) < 6 or not parts[5].startswith("/") or parts[5].startswith("/dev/"):
+        var slash = line.find(" /")  # the path starts at the first " /" (fields 1-5 hold no slash)
+        if len(parts) < 6 or slash < 0 or line[byte=slash + 1 :].startswith("/dev/"):
             continue
         var r = parts[0].split("-")
         var s = hexval(r[0])
         var e = hexval(r[1])
-        var p = String(parts[5])
+        var p = String(line[byte=slash + 1 :])
         var found = False
         for i in range(len(out)):
             if out[i].path == p:
@@ -140,6 +142,19 @@ def human(b: UInt64) -> String:
     return String(b) + " B"
 
 
+def jstr(s: String) -> String:  # a JSON string literal: quotes, backslashes and control bytes escaped
+    var out = String('"')
+    for c in s.codepoints():
+        var u = Int(c.to_u32())
+        if u == 34 or u == 92:
+            out += "\\" + chr(u)
+        elif u < 32:
+            out += "\\u00" + ("0" if u < 16 else "1") + hex(u % 16)[byte=2:]
+        else:
+            out += chr(u)
+    return out + '"'
+
+
 def sq(s: String) -> String:  # one shell word, whatever the path holds
     return "'" + s.replace("'", "'\\''") + "'"
 
@@ -172,7 +187,7 @@ def symbolize(stacks: List[Stack], wanted: List[Int], maps: List[Mapping], dir: 
                 ref m = maps[mi]
                 if ip >= m.start and ip < m.end:
                     if not m.path.endswith("libheaptide.so"):
-                        req += m.path + " 0x" + hex(ip - (0 if fixed[mi] else m.start) - 1)[byte=2:] + "\n"
+                        req += '"' + m.path + '" 0x' + hex(ip - (0 if fixed[mi] else m.start) - 1)[byte=2:] + "\n"
                         keys.append(w)
                         mods.append(String(m.path[byte=m.path.rfind("/") + 1 :]))
                     break
@@ -253,31 +268,45 @@ def main() raises:
     var as_json = False
     var n_top = 10
     var fail_on = String("any")
-    var supp = List[String]()
     var limit = 0.0  # --growth-limit, bytes; 0 = relative rule only
+    # glibc's dlerror buffer: freed by libc at exit without passing through malloc's hooks
+    var supp: List[String] = ["_dlerror_run"]
     var i = 2
     while i < len(args):
-        if args[i] == "--json":
+        var flag = String(args[i])
+        if flag == "--json":
             as_json = True
-        elif args[i] == "--top":
-            n_top = Int(args[i + 1])
             i += 1
-        elif args[i] == "--growth-limit":
-            limit = Float64(args[i + 1]) * 1048576.0
-            i += 1
-        elif args[i] == "--fail-on":
-            fail_on = String(args[i + 1])
-            if fail_on not in ["any", "leaks", "growth", "none"]:
-                print("FAIL report: --fail-on takes any, leaks, growth or none, not", fail_on, file=stderr)
-                exit(2)
-            i += 1
-        elif args[i] == "--supp":
-            with open(String(args[i + 1]), "r") as f:
-                for l in f.read().split("\n"):
-                    if l.byte_length() > 0 and not l.startswith("#"):
-                        supp.append(String(l))
-            i += 1
-        i += 1
+            continue
+        if flag not in ["--top", "--growth-limit", "--fail-on", "--supp"]:
+            print("FAIL report: unknown option", flag, file=stderr)
+            exit(2)
+        if i + 1 >= len(args):
+            print("FAIL report:", flag, "needs a value", file=stderr)
+            exit(2)
+        var v = String(args[i + 1])
+        try:
+            if flag == "--top":
+                n_top = Int(v)
+                if n_top < 1:
+                    raise Error()
+            elif flag == "--growth-limit":
+                limit = Float64(v) * 1048576.0
+                if not (limit > 0):
+                    raise Error()
+            elif flag == "--fail-on":
+                fail_on = v
+                if fail_on not in ["any", "leaks", "growth", "none"]:
+                    raise Error()
+            else:
+                with open(v, "r") as f:
+                    for l in f.read().split("\n"):
+                        if l.byte_length() > 0 and not l.startswith("#"):
+                            supp.append(String(l))
+        except:
+            print("FAIL report: bad value for", flag, ":", v, "(--top N >= 1, --growth-limit MIB > 0, --fail-on any|leaks|growth|none, --supp readable file)", file=stderr)
+            exit(2)
+        i += 2
 
     var bad = False
     var nbin = 0
@@ -307,28 +336,42 @@ def main() raises:
         var b: List[UInt8]
         with open(dir + "/" + name, "r") as f:
             b = f.read_bytes()
-        if len(b) < 64 or u64(b, 0) != 0x4544495450414548:
+        if len(b) < 64 or u64(b, 0) != 0x4544495450414548 or not pid.is_ascii_digit():
             print("FAIL report: bad header in", name, file=stderr)
+            exit(2)
+        # counts are bounded before any arithmetic (the shim writes < 2^24 stacks, < 2^31 frames,
+        # < 2^21 samples), then the file must hold every section they promise
+        if u64(b, 16) >= 1 << 25 or u64(b, 24) >= 1 << 31 or u64(b, 32) >= 1 << 21:
+            print("FAIL report: impossible counts in", name, file=stderr)
             exit(2)
         var n = Int(u64(b, 16))
         var nips = Int(u64(b, 24))
         var nsamp = Int(u64(b, 32))
         var every = u64(b, 40)
+        var has_blk = (u64(b, 48) & 1) == 1
         var ips_at = 64
         var rows_at = ips_at + nips * 8
         var dir_at = rows_at + n * ROW
         var ind_at = dir_at + n * 8
         var smp_at = ind_at + n * 8
+        var blk_at = smp_at + nsamp * 24
+        if len(b) < blk_at + (n * 8 if has_blk else 0):
+            print("FAIL report: truncated file", name, file=stderr)
+            exit(2)
         var stacks = List[Stack]()
         for s in range(n):
             var r = rows_at + s * ROW
             var off = Int(u32(b, r + 48))
             var depth = Int(b[r + 53])
+            if off + depth > nips:
+                print("FAIL report: stack", s + 1, "points past the frames in", name, file=stderr)
+                exit(2)
             var ips = List[UInt64]()
             for d in range(depth):
                 ips.append(u64(b, ips_at + (off + d) * 8))
             stacks.append(Stack(u64(b, r), u64(b, r + 8), u64(b, r + 16), u64(b, r + 24), u64(b, r + 32), u64(b, r + 40),
-                                u64(b, dir_at + s * 8), u64(b, ind_at + s * 8), Int(b[r + 52]), ips^))
+                                u64(b, dir_at + s * 8), u64(b, ind_at + s * 8),
+                                u64(b, blk_at + s * 8) if has_blk else u64(b, r + 24), Int(b[r + 52]), ips^))
 
         var maps = load_maps(dir + "/heaptide." + pid + ".maps")
         var all_ids = List[Int]()
@@ -339,9 +382,11 @@ def main() raises:
                 leaking.append(s)
         var sections = [leaking^, top(stacks, 1, n_top, all_ids), top(stacks, 2, n_top, all_ids), top(stacks, 3, n_top, all_ids)]
         var wanted = List[Int]()
+        var seen = List[Bool](length=len(stacks), fill=False)
         for sec in sections:
             for w in sec:
-                if w not in wanted:
+                if not seen[w]:
+                    seen[w] = True
                     wanted.append(w)
         var sites = symbolize(stacks, wanted, maps, dir, pid)
 
@@ -365,7 +410,7 @@ def main() raises:
             var site = sites.get(w, String("?"))
             if len(leak_lines) < n_top:
                 leak_lines.append(String("  ", human(stacks[w].direct + stacks[w].indirect), " (direct ", stacks[w].direct,
-                                         ", indirect ", stacks[w].indirect, ", ", stacks[w].live_n, " blocks) ", kind_name(stacks[w].kind), "  ", site))
+                                         ", indirect ", stacks[w].indirect, ", ", stacks[w].leaked_n, " blocks) ", kind_name(stacks[w].kind), "  ", site))
 
         # GROWTH: slope of live bytes after the first 20% of samples; when that fails, the window
         # start moves later (up to half the run) to skip a long setup, and the earliest window whose
@@ -409,8 +454,8 @@ def main() raises:
                     json += ","
                 first = False
                 json += String('{"bytes":', stacks[w].direct + stacks[w].indirect, ',"direct":', stacks[w].direct,
-                               ',"indirect":', stacks[w].indirect, ',"blocks":', stacks[w].live_n, ',"kind":"',
-                               kind_name(stacks[w].kind), '","site":"', site.replace('"', "'"), '"}')
+                               ',"indirect":', stacks[w].indirect, ',"blocks":', stacks[w].leaked_n, ',"kind":"',
+                               kind_name(stacks[w].kind), '","site":', jstr(site), '}')
             json += "]}"
             continue
 

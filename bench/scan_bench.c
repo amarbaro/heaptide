@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 AMARBARO · amarbaro.org labs
-// Exit-scan worst case: 1M live 64 B blocks, each word an interior pointer into a random block.
+// Exit-scan worst case (argv[1] blocks, default 1M): live 64 B blocks, each word an interior pointer into a random block.
 #include <stdint.h>
 #include <stdlib.h>
-enum { N = 1 << 20 };
+static int N = 1 << 20;
 uint64_t **all;
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc > 1) N = atoi(argv[1]);
   all = malloc(N * sizeof *all);
   for (int i = 0; i < N; i++) all[i] = malloc(64);
   uint64_t x = 1;

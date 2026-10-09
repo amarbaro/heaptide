@@ -14,7 +14,9 @@ symbolizes the stacks.
 - `mmap`, `mmap64`, `munmap`, `mremap`, for anonymous mappings that are not `PROT_NONE` (kind
   `mmap`). An anonymous `PROT_NONE` mapping is kept as a reservation: `mprotect` that commits
   part of it adds that range as an `mmap` block at the `mprotect` call, and `mprotect(PROT_NONE)`
-  or `madvise(MADV_DONTNEED|MADV_FREE)` removes it again.
+  removes it again. `madvise(MADV_DONTNEED|MADV_FREE)` moves the range to a returned list that
+  keeps its site; at report time `mincore` finds its resident pages (reused by plain writes, as
+  Go's allocator does) and they count again. `mremap` of a reservation moves its entries.
 - `hipMalloc`, `hipMallocAsync`, `hipHostMalloc`, `hipFree`, `hipFreeAsync`, `hipHostFree`
 - `dlsym`, because the Mojo runtime resolves HIP functions through `dlsym` after `dlopen`, which
   plain symbol interposition never sees. Other names are passed on with a forced tail call
@@ -34,18 +36,33 @@ own memory comes from raw `syscall(SYS_mmap)`.
 1. `unw_backtrace` (libunwind, per-thread cache) collects up to 64 return addresses. The shim's
    own frames are dropped. The stack ends before the first address it repeats: CPython re-enters
    its eval loop through C on every import and callback, and recursion adds no new call site.
-2. The frames are hashed (64-bit) into a stack id. A new stack copies its frames into one mmap'd
+2. The frames are hashed (64-bit) into a stack id. The table entry also keeps a second,
+   independent 32-bit hash; a hit whose check differs is another stack and takes the next key. A new stack copies its frames into one mmap'd
    arena and gets a 56 B counter row.
 3. The block goes into a 64-shard open-addressing table, 16 B per entry: address, then size,
    flags and stack id packed into one word.
 4. The row's counters (allocations, bytes, temporaries, live blocks, live bytes) are batched per
    thread: each thread holds pending changes for 16 call sites in its own slot and adds them to
-   the shared row every 64 updates, on eviction, before a peak check, and at exit. Live bytes per
+   the shared row every 64 updates, on eviction, before a peak check, and at exit (a snapshot's
+   fork flushes every thread's slot in its own copy). Live bytes per
    kind are counted per thread, one cache line each, and summed by readers. With 8 threads at one
    call site, the shared atomic counters were 77% of the time (perf), not the unwinding (0.4%).
 5. Every 256th allocation of a thread, and on any block of 64 KiB or more, the summed live total
    is compared with the last peak. When it is 1% higher, each row's live bytes are copied into
    its peak field. No event log is kept.
+
+A call stack's id comes from a sharded hash table under a spinlock; each thread also keeps a
+64-entry cache of stack hash -> id (ids never change), so the common case, a site seen before,
+takes no lock. Before the cache, 8 threads allocating at one site spent 80% of their time queued
+on one shard's lock (perf) and the benchmark moved +-30% with code layout alone.
+
+`realloc(p, 0)` frees `p` (glibc), so only a failed non-zero `realloc` restores the old block; a
+failed `hipFree` restores its block too. `errno` is saved around the bookkeeping. The `dlsym` hook
+hands out its HIP wrappers only when the real symbol exists. `mremap` moves the part of every
+range inside the source (a reservation cut in the middle included) and, with `MREMAP_FIXED`,
+forgets what the destination replaced. Under an address-space limit (`ulimit -v`) the row and
+frame arenas shrink to a quarter of it; if even that cannot be mapped, the shim records nothing
+and says so, and a report that cannot get its memory says so instead of writing a partial file.
 
 A free that hits the block allocated last on the same thread counts as a temporary (heaptrack's
 definition). Anonymous mappings live in a separate locked array: a partial `munmap` trims or
@@ -54,10 +71,36 @@ replaces whatever was mapped there.
 
 A sampler thread records time, live host bytes and live GPU bytes every `--every` ms.
 
-## At exit (LeakSanitizer's design)
+## At exit, on a signal, or as a snapshot (LeakSanitizer's design)
 
 The shim registers its exit handler first, so it runs after the program's own `atexit`
-handlers and static destructors.
+handlers and static destructors. SIGTERM, SIGINT and SIGHUP get a handler that only sets a flag,
+where the program kept the default; the sampler thread then writes the report and re-raises the
+signal, so the process still dies of it. The sampler also writes snapshots: every
+`--snapshot-every`, or when `OUT/snapshot` appears (`heaptide snapshot`). A snapshot is the same
+report of a copy: with the threads parked and their stack pointers read, the sampler forks with a
+raw `clone` (no atfork handlers, no malloc locks a parked thread may hold, no exit signal so the
+program's `wait` never sees it) and releases the threads; the child scans its copy-on-write image,
+writes the files under the parent's pid and exits, and the sampler reaps it before the next one.
+The pause is the fork: 1M live blocks 147 -> 3-7 ms, 10M 1851 -> 15 ms (`bench/snap_pause.c`).
+If the fork fails (no memory, process limit) the snapshot scans in place and restores the reach
+marks afterwards. When a thread cannot be parked the snapshot is skipped, since that thread could
+be growing the table being read. Files are written as `.tmp` and renamed.
+
+A crash (SEGV, BUS, FPE, ILL, ABRT, where the program kept the default) sets the same flag and the
+crashing thread waits, on a signal stack so a stack overflow works too (the main thread's is
+static, other threads get one at their first allocation); its stack is
+scanned from the interrupted stack pointer. The sampler writes the report and kills the process
+with the signal. After 10 s (a crash inside the shim, a heap too broken to scan) the thread gives up
+and dies as it would have.
+
+With `--py`, the Python runner installs its own SIGTERM/SIGHUP handler: it writes the PYTHON
+section, calls the shim's exported `heaptide_final()` (the native report, heap untouched), then
+re-raises the signal. A stop signal that arrives before that handler exists (interpreter startup)
+is held by the shim and handed over by `heaptide_py_ready()`, which the runner calls once its
+handler is in; if Python exits first, the shim re-raises it after the report. Ctrl-C needs nothing extra: `KeyboardInterrupt` exits through `atexit`. A
+watcher thread rewrites the PYTHON section whenever the native `.bin` changes, so every snapshot
+has one.
 
 0. **List the loaded objects' writable segments** (`dl_iterate_phdr`) while the other threads
    still run: a thread parked inside the loader would hold the lock that call needs.
@@ -68,8 +111,11 @@ handlers and static destructors.
    instead.
 2. **Roots.** These are scanned for 8-byte words pointing at or into a live CPU or mmap block
    (LeakSanitizer does the same). A word below the lowest block or past the highest is dropped
-   at once; any other word goes to a branchless binary search over the blocks sorted by start, first on every 64th start (`top`, cache resident), then in one 1 KiB run. Worst case,
-   every word an interior pointer (`bench/scan_bench.c`, 1M blocks): exit 0.62 s → 2.1 s.
+   at once; any other word goes to a branchless binary search over the blocks sorted by start,
+   in three levels (every 256th start, every 16th, then a 16-entry run of 4 cache lines). Words
+   go through 16 at a time, level by level, with each word's next run prefetched before any is
+   read, so the misses of a large heap overlap. Worst case, every word an interior pointer
+   (`bench/scan_bench.c`): 1M blocks 1.05 s, 10M blocks 16.6 s (bare program 0.05 / 0.79 s).
    - the writable segments of every loaded object
    - every other thread's registers, and its stack from the stack pointer up. The thread calling
      exit is not scanned: its returned frames leave stale pointers (on Ubuntu 24.04 one hid a real

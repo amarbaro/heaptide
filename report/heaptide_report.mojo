@@ -4,13 +4,24 @@
 # Reads DIR/heaptide.<pid>.{bin,maps} (+ py.<pid>.txt), symbolizes the reported stacks in one
 # llvm-symbolizer batch, prints LEAKS / GROWTH / PEAK / HOTSPOTS / TEMPORARIES / PYTHON.
 # Exit 0 clean, 1 leak or growth (per --fail-on), 2 tool error.
-from std.sys import argv, exit
+from std.sys import argv, exit, stderr
 from std.os import listdir, getenv
 from std.ffi import external_call
 
 comptime ROW = 56
 # $HEAPTIDE_SYMBOLIZER, else llvm-symbolizer on PATH, else ROCm's copy; exit 3 when none runs
 comptime FIND_SYMBOLIZER = "S=${HEAPTIDE_SYMBOLIZER:-$(command -v llvm-symbolizer || echo /opt/rocm/llvm/bin/llvm-symbolizer)}; [ -x \"$S\" ] || exit 3; \"$S\""
+# Stripped modules: swap in the debug file from elfutils' cache (shared with gdb), fetched by
+# build-id from $DEBUGINFOD_URLS when missing. Reads the request file $I in place.
+comptime DEBUGINFOD = """c=${XDG_CACHE_HOME:-$HOME/.cache}/debuginfod_client
+for m in $(cut -d' ' -f1 "$I" | sort -u); do
+  readelf -S "$m" 2>/dev/null | grep -q debug_info && continue
+  id=$(readelf -n "$m" 2>/dev/null | awk '/Build ID/{print $3}'); [ -n "$id" ] || continue
+  d=$c/$id/debuginfo
+  [ -s "$d" ] || [ -z "${DEBUGINFOD_URLS:-}" ] || { mkdir -p "$c/$id" && curl -sfL --max-time 120 "${DEBUGINFOD_URLS%% *}/buildid/$id/debuginfo" -o "$d.tmp" && mv "$d.tmp" "$d" || echo "note: debuginfod has no debug file for $m" >&2; }
+  [ -s "$d" ] && sed -i "s|^$m |$d |" "$I"
+done
+"""
 
 
 def kind_name(k: Int) -> String:
@@ -85,14 +96,14 @@ def load_maps(path: String) raises -> List[Mapping]:
     return out^
 
 
-def top(stacks: List[Stack], key: Int, n: Int) -> List[Int]:
-    # indices of the n largest non-zero values of field `key`, largest first
+def top(stacks: List[Stack], key: Int, n: Int, among: List[Int]) -> List[Int]:
+    # indices (from `among`) of the n largest non-zero values of field `key`, largest first
     var picked = List[Int]()
     var used = List[Bool](length=len(stacks), fill=False)
     for _ in range(n):
         var best = -1
         var bv: UInt64 = 0
-        for i in range(len(stacks)):
+        for i in among:
             var v = field(stacks[i], key)
             if not used[i] and v > bv:
                 best = i
@@ -129,6 +140,19 @@ def human(b: UInt64) -> String:
     return String(b) + " B"
 
 
+def sq(s: String) -> String:  # one shell word, whatever the path holds
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def is_exec(path: String) -> Bool:  # ET_EXEC (non-PIE): the symbolizer wants the absolute address
+    try:
+        with open(path, "r") as f:
+            var h = f.read_bytes(18)
+            return len(h) == 18 and h[16] == 2
+    except:
+        return False
+
+
 def user_file(path: String) -> Bool:
     return path.startswith("/") and not path.startswith("/usr/") and not path.startswith("/opt/") and not ("/.venv/" in path)
 
@@ -139,12 +163,16 @@ def symbolize(stacks: List[Stack], wanted: List[Int], maps: List[Mapping], dir: 
     var keys = List[Int]()
     var mods = List[String]()
     var exe = String(maps[0].path[byte=maps[0].path.rfind("/") + 1 :]) if len(maps) > 0 else String()
+    var fixed = List[Bool]()
+    for m in maps:
+        fixed.append(is_exec(m.path))
     for w in wanted:
         for ip in stacks[w].ips:
-            for m in maps:
+            for mi in range(len(maps)):
+                ref m = maps[mi]
                 if ip >= m.start and ip < m.end:
                     if not m.path.endswith("libheaptide.so"):
-                        req += m.path + " 0x" + hex(ip - m.start - 1)[byte=2:] + "\n"
+                        req += m.path + " 0x" + hex(ip - (0 if fixed[mi] else m.start) - 1)[byte=2:] + "\n"
                         keys.append(w)
                         mods.append(String(m.path[byte=m.path.rfind("/") + 1 :]))
                     break
@@ -152,11 +180,11 @@ def symbolize(stacks: List[Stack], wanted: List[Int], maps: List[Mapping], dir: 
     var outp = dir + "/.sym." + pid + ".out"
     with open(inp, "w") as f:
         f.write(req)
-    var cmd = String(FIND_SYMBOLIZER, " --no-inlines < '", inp, "' > '", outp, "'\0")
+    var cmd = String("I=", sq(inp), "\n", DEBUGINFOD, FIND_SYMBOLIZER, " --no-inlines < ", sq(inp), " > ", sq(outp), "\0")
     var rc = external_call["system", Int32](cmd.unsafe_ptr())
     var text = String()
     if rc == 3 << 8:  # no symbolizer: sites name modules only
-        print("note: no llvm-symbolizer (install LLVM or set HEAPTIDE_SYMBOLIZER); sites show modules only")
+        print("note: no llvm-symbolizer (install LLVM or set HEAPTIDE_SYMBOLIZER); sites show modules only", file=stderr)
         for _ in range(len(keys)):
             text += "??\n??:0\n\n"
     elif rc != 0:
@@ -182,7 +210,8 @@ def symbolize(stacks: List[Stack], wanted: List[Int], maps: List[Mapping], dir: 
         var n = shown.get(k, 0)
         # user frame: own source file, or (no debug info) a frame in the program's own executable
         var user = (user_file(String(loc[byte=: loc.find(":")])) if loc.find(":") > 0 else False) or (loc.startswith("??") and mods[ki] == exe)
-        if n >= 100 or (n >= 2 and not user):
+        # tracemalloc's hooks are heaptide's own instrumentation in --py mode, like libheaptide
+        if n >= 100 or (n >= 2 and not user) or func.startswith("tracemalloc_"):
             continue
         var slash = loc.rfind("/")
         var frame = func if loc.startswith("??") else String(func, " ", String(loc[byte=slash + 1 :]) if slash >= 0 else loc)
@@ -218,7 +247,7 @@ def fit(b: List[UInt8], smp_at: Int, a: Int, nsamp: Int, span: Float64, limit: F
 def main() raises:
     var args = argv()
     if len(args) < 2:
-        print("usage: heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none] [--growth-limit MIB]")
+        print("usage: heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none] [--growth-limit MIB]", file=stderr)
         exit(2)
     var dir = String(args[1])
     var as_json = False
@@ -238,6 +267,9 @@ def main() raises:
             i += 1
         elif args[i] == "--fail-on":
             fail_on = String(args[i + 1])
+            if fail_on not in ["any", "leaks", "growth", "none"]:
+                print("FAIL report: --fail-on takes any, leaks, growth or none, not", fail_on, file=stderr)
+                exit(2)
             i += 1
         elif args[i] == "--supp":
             with open(String(args[i + 1]), "r") as f:
@@ -255,7 +287,7 @@ def main() raises:
     try:
         names_in_dir = listdir(dir)
     except:
-        print("FAIL report: cannot read", dir)
+        print("FAIL report: cannot read", dir, file=stderr)
         exit(2)
     # the main process (most call stacks) is never collapsed into QUIET
     var main_bin = String()
@@ -276,7 +308,7 @@ def main() raises:
         with open(dir + "/" + name, "r") as f:
             b = f.read_bytes()
         if len(b) < 64 or u64(b, 0) != 0x4544495450414548:
-            print("FAIL report: bad header in", name)
+            print("FAIL report: bad header in", name, file=stderr)
             exit(2)
         var n = Int(u64(b, 16))
         var nips = Int(u64(b, 24))
@@ -299,7 +331,13 @@ def main() raises:
                                 u64(b, dir_at + s * 8), u64(b, ind_at + s * 8), Int(b[r + 52]), ips^))
 
         var maps = load_maps(dir + "/heaptide." + pid + ".maps")
-        var sections = [top(stacks, 0, 1000), top(stacks, 1, n_top), top(stacks, 2, n_top), top(stacks, 3, n_top)]
+        var all_ids = List[Int]()
+        var leaking = List[Int]()  # all of them: totals and suppressions must not stop at a display cap
+        for s in range(len(stacks)):
+            all_ids.append(s)
+            if field(stacks[s], 0) > 0:
+                leaking.append(s)
+        var sections = [leaking^, top(stacks, 1, n_top, all_ids), top(stacks, 2, n_top, all_ids), top(stacks, 3, n_top, all_ids)]
         var wanted = List[Int]()
         for sec in sections:
             for w in sec:
@@ -311,16 +349,20 @@ def main() raises:
         var leak_d: UInt64 = 0
         var leak_i: UInt64 = 0
         var leak_lines = List[String]()
+        var kept = List[Int]()
         for w in sections[0]:
             var site = sites.get(w, String("?"))
             var skip = False
             for p in supp:
                 if p in site:
                     skip = True
-            if skip:
-                continue
-            leak_d += stacks[w].direct
-            leak_i += stacks[w].indirect
+            if not skip:
+                kept.append(w)
+                leak_d += stacks[w].direct
+                leak_i += stacks[w].indirect
+        var shown = top(stacks, 0, 1000, kept)  # JSON lists up to 1000, text up to --top
+        for w in shown:
+            var site = sites.get(w, String("?"))
             if len(leak_lines) < n_top:
                 leak_lines.append(String("  ", human(stacks[w].direct + stacks[w].indirect), " (direct ", stacks[w].direct,
                                          ", indirect ", stacks[w].indirect, ", ", stacks[w].live_n, " blocks) ", kind_name(stacks[w].kind), "  ", site))
@@ -361,14 +403,8 @@ def main() raises:
                            '","growth_bytes_per_s":', Int(slope), ',"growth_window_bytes":', Int(max(grow, 0.0)),
                            ',"window_from_s":', steady if steady.byte_length() > 0 else String("0"), ',"leaks":[')
             var first = True
-            for w in sections[0]:
+            for w in shown:
                 var site = sites.get(w, String("?"))
-                var skip = False
-                for q in supp:
-                    if q in site:
-                        skip = True
-                if skip:
-                    continue
                 if not first:
                     json += ","
                 first = False
@@ -410,7 +446,7 @@ def main() raises:
             q += " " + x
         print("QUIET (peak < 1 MiB, leaks < 64 KiB, no growth):" + q)
     if nbin == 0:
-        print("FAIL report: no heaptide.*.bin in", dir)
+        print("FAIL report: no heaptide.*.bin in", dir, file=stderr)
         exit(2)
     if as_json:
         print(json + "]")

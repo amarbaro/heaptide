@@ -16,13 +16,14 @@ JSON, not the text: it is the stable interface.
    the run.
 2. **Run.**
    ```
-   heaptide run [--gpu] [--py] [--every MS] --out .work/ht -- <cmd> <args>
+   heaptide run [--gpu] [--py] [--py-depth N] [--every MS] --out .work/ht -- <cmd> <args>
    heaptide report .work/ht --json > .work/ht/report.json
    ```
    - Build C/C++ with `-g` and Mojo with `-g1` (full `-g` can fail on large kernels), or sites
      stop at the executable's symbol.
    - `--gpu` for any Mojo GPU program. Without it Mojo pools its buffers and you see one block.
-   - `--py` for a Python entry point (the command must be `python...`).
+   - `--py` for a Python entry point (the command must be `python...`). Add `--py-depth 4` when
+     one helper is called from many places: PYTHON then shows each call chain, not one line.
    - Short runs need a faster sampler or GROWTH says `too short`: `--every 20` under a few
      seconds, `--every 1` under one second.
 3. **Read** `report.json`: one object per process. Children are traced too; the target is
@@ -48,9 +49,8 @@ Exit codes: `report` returns 0 clean, 1 leak or growth (per `--fail-on any|leaks
 | `direct` at a site in your code | unfreed and nothing points to it | fix: free it, or give it an owner |
 | `indirect` only | held only by another leaked block | fix that block's owner |
 | `kind: gpu` or `host` unfreed | device or pinned buffer never freed | always real: GPU blocks are never treated as reachable |
-| `kind: mmap` | an anonymous mapping never unmapped | real unless it is an arena the runtime keeps by design |
-| a few KiB in `[libamdhip64…]`, `[libhsa…]`, `_dl_*` | runtime residue (interior pointers heaptide does not follow) | suppress, do not "fix" |
-| ~170 KiB in `[libpython…]` with `--py` | CPython does not free everything at exit; LeakSanitizer reports more | suppress; read the PYTHON section instead |
+| `kind: mmap` | an anonymous mapping never unmapped, or a part of a `PROT_NONE` reservation that `mprotect` committed (site = the `mprotect` call) | real unless it is an arena the runtime keeps by design |
+| a few hundred B in `hsa_amd_signal_create`, `amd::roc::Device`, `_dl_*` | HIP/Mojo runtime residue | suppress, do not "fix" |
 | GROWTH FAIL, few direct leaks | memory held, not lost: caches, queues, pools that keep growing | find the owner via PEAK and HOTSPOTS in the text report |
 | GROWTH `too short` | fewer than 5 samples | run longer or lower `--every` |
 

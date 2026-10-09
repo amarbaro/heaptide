@@ -28,6 +28,11 @@
 
 #define TLS __thread __attribute__((tls_model("initial-exec")))
 #define HOOK __attribute__((visibility("default")))
+#if __has_attribute(musttail)  // GCC 15+, clang; older GCC still tail-calls at -O2
+#define MUSTTAIL __attribute__((musttail))
+#else
+#define MUSTTAIL
+#endif
 enum { CPU, GPU, HOST, MMAP };
 enum { DEPTH = 64, SHARDS = 64, MAXSTACKS = 1 << 24, MAXSAMPLES = 1 << 20 };
 enum { REACH = 1 << 24, INDIRECT = 1 << 25, SIZE_SHIFT = 26 };
@@ -110,7 +115,7 @@ static int (*r_posix_memalign)(void **, size_t, size_t);
 static void *(*r_aligned_alloc)(size_t, size_t), *(*r_memalign)(size_t, size_t), *(*r_valloc)(size_t);
 static void *(*r_dlsym)(void *, const char *);
 static void *(*r_mmap)(void *, size_t, int, int, int, off_t), *(*r_mremap)(void *, size_t, size_t, int, ...);
-static int (*r_munmap)(void *, size_t);
+static int (*r_munmap)(void *, size_t), (*r_mprotect)(void *, size_t, int), (*r_madvise)(void *, size_t, int);
 
 static void *vm(size_t n) {  // raw syscall: our own memory never passes the mmap hook
   void *p = (void *)syscall(SYS_mmap, 0, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -203,24 +208,25 @@ static void track(void *p, size_t n, int kind) {
   guard = 0;
 }
 
-static void untrack(void *p) {
-  if (!p || !ready || guard) return;
+static uint64_t untrack(void *p) {  // the block's live-table value, 0 when untracked
+  if (!p || !ready || guard) return 0;
   uint64_t v;
   tab_t *s = shard(live, (uint64_t)p);
   lock(&s->lk); int hit = del(s, (uint64_t)p, &v); unlock(&s->lk);
-  if (!hit) return;
+  if (!hit) return 0;
   uint32_t id = v & (REACH - 1);
   int64_t n = v >> SIZE_SHIFT;
   bump(id, 0, 0, p == last_alloc, -1, -n);
   add_live(rows[id].kind, -n);
   last_alloc = 0;
+  return v;
 }
 
 // Anonymous mappings made outside the hooked allocators: few, so one locked array; a partial
 // munmap trims or splits an entry. They join the live table at exit.
-typedef struct { uint64_t a, n; uint32_t id; } map_t;
-static map_t *mm;
-static size_t nmm;
+typedef struct { uint64_t a, n; uint32_t id, inh; } map_t;  // inh: mapped before a fork
+static map_t *mm, *rs;  // rs: PROT_NONE reservations, counted only once mprotect commits them
+static size_t nmm, nrs;
 static atomic_flag mm_lk;
 static uint64_t pages(size_t n) { return (n + 4095) & ~4095UL; }
 static void mm_add(void *p, size_t len, uint32_t id) {  // holds mm_lk
@@ -228,23 +234,25 @@ static void mm_add(void *p, size_t len, uint32_t id) {  // holds mm_lk
   row_t *r = &rows[id];
   r->allocs++; r->bytes += n; r->live_n++; r->live_b += n;
   add_live(MMAP, n);
-  if (nmm < (1 << 20)) mm[nmm++] = (map_t){(uint64_t)p, n, id};
+  if (nmm < (1 << 20)) mm[nmm++] = (map_t){(uint64_t)p, n, id, 0};
 }
-static int mm_cut(void *p, size_t len) {  // forget [p, p+len) in every entry; holds mm_lk
+// forget [p, p+len) in every entry of mm (counted) or rs (not); holds mm_lk
+static int cut(map_t *v, size_t *nv, void *p, size_t len) {
   uint64_t a = (uint64_t)p, e = a + pages(len);
-  int hit = 0;
-  for (size_t i = 0; i < nmm; i++) {
-    map_t m = mm[i];
+  int hit = 0, acct = v == mm;
+  for (size_t i = 0; i < *nv; i++) {
+    map_t m = v[i];
     uint64_t lo = a > m.a ? a : m.a, hi = e < m.a + m.n ? e : m.a + m.n;
     if (lo >= hi) continue;
     hit = 1;
-    rows[m.id].live_b -= hi - lo; add_live(MMAP, -(int64_t)(hi - lo));
-    if (hi < m.a + m.n && nmm < (1 << 20)) { mm[nmm++] = (map_t){hi, m.a + m.n - hi, m.id}; rows[m.id].live_n++; }
-    if (lo > m.a) mm[i].n = lo - m.a;
-    else { mm[i--] = mm[--nmm]; rows[m.id].live_n--; }
+    if (acct) { rows[m.id].live_b -= hi - lo; add_live(MMAP, -(int64_t)(hi - lo)); }
+    if (hi < m.a + m.n && *nv < (1 << 20)) { v[(*nv)++] = (map_t){hi, m.a + m.n - hi, m.id, m.inh}; if (acct) rows[m.id].live_n++; }
+    if (lo > m.a) v[i].n = lo - m.a;
+    else { v[i--] = v[--*nv]; if (acct) rows[m.id].live_n--; }
   }
   return hit;
 }
+static int mm_cut(void *p, size_t len) { return cut(mm, &nmm, p, len); }
 static int watch(void) { return ready && !guard && !in_alloc; }
 
 // dlsym may calloc before the real allocators are known: serve those from here.
@@ -271,7 +279,7 @@ static void resolve(void) {
   r_calloc = next("calloc"); r_realloc = next("realloc"); r_free = next("free");
   r_posix_memalign = next("posix_memalign"); r_aligned_alloc = next("aligned_alloc");
   r_memalign = next("memalign"); r_valloc = next("valloc");
-  r_mmap = next("mmap"); r_munmap = next("munmap"); r_mremap = next("mremap");
+  r_mmap = next("mmap"); r_munmap = next("munmap"); r_mprotect = next("mprotect"); r_madvise = next("madvise"); r_mremap = next("mremap");
   r_malloc = next("malloc");
   resolving = 0;
 }
@@ -286,9 +294,18 @@ HOOK void free(void *p) { if (!p || in_boot(p)) return; resolve(); untrack(p); i
 HOOK void *realloc(void *p, size_t n) {
   resolve();
   if (in_boot(p)) { void *q = malloc(n); if (q) memcpy(q, p, n); return q; }
-  untrack(p);
+  int temp = p == last_alloc;
+  uint64_t v = untrack(p);  // before the call: once p is freed inside, another thread may get it
   void *q = IN(r_realloc(p, n));
-  track(q ? q : p, q ? n : 0, CPU);  // failed realloc keeps p alive; size unknown here, kept as 0
+  if (q) track(q, n, CPU);
+  else if (v && !guard) {  // failed: p is still live, with its old size and site
+    uint32_t id = v & (REACH - 1);
+    int64_t b = v >> SIZE_SHIFT;
+    tab_t *s = shard(live, (uint64_t)p);
+    lock(&s->lk); put(s, (uint64_t)p, v); unlock(&s->lk);
+    bump(id, 0, 0, -temp, 1, b);
+    add_live(CPU, b);
+  }
   return q;
 }
 HOOK void *reallocarray(void *p, size_t c, size_t n) {
@@ -306,13 +323,14 @@ HOOK void free_aligned_sized(void *p, size_t a, size_t n) { (void)a; (void)n; fr
 HOOK void *mmap(void *a, size_t n, int prot, int fl, int fd, off_t off) {
   resolve();
   void *p = r_mmap(a, n, prot, fl, fd, off);
-  int anon = (fl & MAP_ANONYMOUS) && prot != PROT_NONE;  // PROT_NONE reserves address space only
-  if (p == MAP_FAILED || !watch() || !(anon || (fl & MAP_FIXED))) return p;
+  int anon = (fl & MAP_ANONYMOUS) && prot != PROT_NONE, res = (fl & MAP_ANONYMOUS) && prot == PROT_NONE;
+  if (p == MAP_FAILED || !watch() || !(anon || res || (fl & MAP_FIXED))) return p;
   guard = 1;
   uint32_t id = anon ? stack_id(MMAP) : 0;
   lock(&mm_lk);
-  if (fl & MAP_FIXED) mm_cut(p, n);  // replaces whatever was mapped there
+  if (fl & MAP_FIXED) mm_cut(p, n), cut(rs, &nrs, p, n);  // replaces whatever was mapped there
   if (anon) mm_add(p, n, id);
+  if (res && nrs < (1 << 16)) rs[nrs++] = (map_t){(uint64_t)p, pages(n), 0, 0};
   unlock(&mm_lk);
   peak_check(0);
   guard = 0;
@@ -324,9 +342,35 @@ HOOK int munmap(void *p, size_t n) {
   if (!watch()) return r_munmap(p, n);
   lock(&mm_lk);  // held across the call: an address freed here may be mapped again by another thread
   int e = r_munmap(p, n);
-  if (!e) mm_cut(p, n);
+  if (!e) mm_cut(p, n), cut(rs, &nrs, p, n);
   unlock(&mm_lk);
   return e;
+}
+// Committing part of a reservation makes it a block at this call; PROT_NONE, or madvise
+// DONTNEED/FREE (how arenas return pages but keep the range), decommits it.
+static void commit(void *p, size_t n, int prot);
+HOOK int mprotect(void *p, size_t n, int prot) { resolve(); int e = r_mprotect(p, n, prot); if (!e) commit(p, n, prot); return e; }
+HOOK int madvise(void *p, size_t n, int adv) {
+  resolve();
+  int e = r_madvise(p, n, adv);
+  if (!e && (adv == MADV_DONTNEED || adv == MADV_FREE)) commit(p, n, PROT_NONE);
+  return e;
+}
+static void commit(void *p, size_t n, int prot) {
+  if (!nrs || !watch()) return;
+  guard = 1;
+  uint32_t id = 0;
+  uint64_t a = (uint64_t)p, z = a + pages(n);
+  lock(&mm_lk);
+  for (size_t i = 0; i < nrs; i++) {
+    uint64_t lo = a > rs[i].a ? a : rs[i].a, hi = z < rs[i].a + rs[i].n ? z : rs[i].a + rs[i].n;
+    if (lo >= hi) continue;
+    mm_cut((void *)lo, hi - lo);
+    if (prot != PROT_NONE) mm_add((void *)lo, hi - lo, id ? id : (id = stack_id(MMAP)));
+  }
+  unlock(&mm_lk);
+  if (id) peak_check(0);
+  guard = 0;
 }
 HOOK void *mremap(void *p, size_t o, size_t n, int fl, ...) {
   va_list ap; va_start(ap, fl); void *to = va_arg(ap, void *); va_end(ap);
@@ -363,7 +407,8 @@ HOOK void *dlsym(void *h, const char *name) {
   for (size_t i = 0; i < sizeof ours / sizeof *ours; i++)
     if (!strcmp(name, ours[i].n)) return ours[i].f;
   if (!r_dlsym) r_dlsym = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
-  return r_dlsym(h, name);
+  // a tail call keeps the caller's return address, which glibc reads to resolve RTLD_NEXT
+  MUSTTAIL return r_dlsym(h, name);
 }
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000ULL + t.tv_nsec; }
@@ -380,16 +425,32 @@ static void *sampler(void *a) {
   return 0;
 }
 
-// Reachability (LSan port, exact block starts only): roots = writable segments of loaded
+// Reachability (LSan port): roots = writable segments of loaded
 // objects; flood through CPU blocks; unreached = leaked; leaked blocks reached from other
 // leaked blocks = indirect.
 static int heap(uint64_t v) { int k = rows[v & (REACH - 1)].kind; return k == CPU || k == MMAP; }
 static uint64_t *work;
 static size_t nwork;
 static ent_t *find_live(uint64_t v) { return v & 7 ? 0 : get(shard(live, v), v); }
+// A word pointing into a block keeps it alive too (LSan): a binary search of the CPU/mmap blocks
+// sorted by start, only for words inside [heap_lo, heap_hi). Every 64th start is copied to `top`,
+// small enough to stay in cache: one search there, one in a 1 KiB run, no hash probe.
+static ent_t *starts;  // {start, its live-table entry}
+static uint64_t *top, nstarts, heap_lo, heap_hi;
+static int cmp64(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return (x > y) - (x < y); }
+static ent_t *find_block(uint64_t v) {
+  if (v < heap_lo || v >= heap_hi) return 0;
+  // last start <= v (top[0] = heap_lo <= v); branchless, a mispredicted step costs more than a load
+  const uint64_t *t = top;
+  for (size_t n = (nstarts + 63) / 64; n > 1; n -= n / 2) t = t[n / 2] <= v ? t + n / 2 : t;
+  const ent_t *r = starts + (t - top) * 64;
+  for (size_t n = nstarts - (r - starts) < 64 ? nstarts - (r - starts) : 64; n > 1; n -= n / 2) r = r[n / 2].k <= v ? r + n / 2 : r;
+  ent_t *x = (ent_t *)r->v;
+  return v < x->k + (x->v >> SIZE_SHIFT) ? x : 0;
+}
 static void scan(const char *b, const char *e, uint64_t bit) {
   for (b = (const char *)(((uintptr_t)b + 7) & ~7UL); b + 8 <= e; b += 8) {
-    ent_t *x = find_live(*(const uint64_t *)b);
+    ent_t *x = find_block(*(const uint64_t *)b);
     // GPU/host blocks are never roots-reachable: the HIP runtime's own tables point at all of them
     if (x && !(x->v & (REACH | INDIRECT)) && heap(x->v)) { x->v |= bit; work[nwork++] = x->k; }
   }
@@ -425,6 +486,8 @@ static void flood(uint64_t bit) {
   while (nwork) { uint64_t p = work[--nwork]; contents(p, find_live(p)->v, bit); }
 }
 static uintptr_t ld_lo, ld_n;  // the dynamic linker's code
+static uint64_t (*segs)[2];  // writable segments, listed before threads park: a parked thread may
+static int nsegs;            // hold the loader lock that dl_iterate_phdr and dladdr take
 static int root_cb(struct dl_phdr_info *in, size_t sz, void *self) {
   (void)sz;
   if (in->dlpi_addr == (uintptr_t)self) return 0;
@@ -433,9 +496,8 @@ static int root_cb(struct dl_phdr_info *in, size_t sz, void *self) {
     if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X) && in->dlpi_addr == getauxval(AT_BASE))
       ld_lo = in->dlpi_addr + ph->p_vaddr, ld_n = ph->p_memsz;
     if (ph->p_type == PT_LOAD && (ph->p_flags & PF_W)) {
-      char *b = (char *)in->dlpi_addr + ph->p_vaddr;
-      scan(b, b + ph->p_memsz, REACH);
-      flood(REACH);
+      uint64_t b = in->dlpi_addr + ph->p_vaddr;
+      if (nsegs < 4096) segs[nsegs][0] = b, segs[nsegs++][1] = b + ph->p_memsz;
     }
   }
   return 0;
@@ -528,15 +590,27 @@ static void wr(int fd, const void *p, size_t n) {
 static void fin(void) {
   if (!ready) return;
   ready = 0; guard = 1; stop = 1;
-  peak_check(1);  // growth after the last 1% step
   size_t total = 0;
-  for (size_t i = 0; i < nmm; i++) put(shard(live, mm[i].a), mm[i].a, mm[i].n << SIZE_SHIFT | mm[i].id);
+  for (size_t i = 0; i < nmm; i++) put(shard(live, mm[i].a), mm[i].a, mm[i].n << SIZE_SHIFT | mm[i].id | (mm[i].inh ? REACH : 0));
   for (int i = 0; i < SHARDS; i++) total += live[i].n;
-  work = vm((total + 1) * 8);
-  stop_threads();
-  flush_all();
+  work = vm((total + 1) * 8); starts = vm((total + 1) * 16);
+  for (int i = 0; i < SHARDS; i++)
+    for (size_t j = 0; j < live[i].cap; j++)
+      if (live[i].t[j].k && heap(live[i].t[j].v)) {
+        uint64_t e = live[i].t[j].k + (live[i].t[j].v >> SIZE_SHIFT);
+        starts[nstarts++] = (ent_t){live[i].t[j].k, (uint64_t)&live[i].t[j]}; heap_hi = e > heap_hi ? e : heap_hi;
+      }
+  qsort(starts, nstarts, 16, cmp64);
+  heap_lo = nstarts ? starts[0].k : 0;
+  top = vm((nstarts / 64 + 1) * 8);
+  for (size_t i = 0; i < nstarts; i += 64) top[i / 64] = starts[i].k;
+  segs = vm(4096 * 16);
   Dl_info me; dladdr((void *)fin, &me);
   dl_iterate_phdr(root_cb, me.dli_fbase);
+  stop_threads();
+  flush_all();
+  peak_check(1);  // growth after the last 1% step; after the flush, so batched rows count
+  for (int i = 0; i < nsegs; i++) scan((char *)segs[i][0], (char *)segs[i][1], REACH), flood(REACH);
   // LSan's use_ld_allocations: a block with a linker frame is a root (a thread's DTV is held as
   // dtv + 1 in its TCB, which an exact-start scan misses)
   for (int i = 0; i < SHARDS; i++)
@@ -546,6 +620,9 @@ static void fin(void) {
       for (int k = 0; x->k && !(x->v & REACH) && r->kind == CPU && k < r->depth; k++)
         if (ips_arena[r->ips_off + k] - ld_lo < ld_n) { x->v |= REACH; work[nwork++] = x->k; }
     }
+  for (int i = 0; i < SHARDS; i++)  // blocks inherited over fork are roots (see forked)
+    for (size_t j = 0; j < live[i].cap; j++)
+      if (live[i].t[j].k && (live[i].t[j].v & REACH)) work[nwork++] = live[i].t[j].k;
   flood(REACH);
   int scanned = scan_threads();
   for (int i = 0; i < SHARDS; i++)
@@ -601,18 +678,36 @@ static int self_cb(struct dl_phdr_info *in, size_t sz, void *self) {
   return 0;
 }
 
+// A forked child inherits the parent's blocks: they are the parent's leaks, not the child's, but
+// may hold the only pointer to a child block. Mark them reachable roots; other threads are gone,
+// so their locks are released and the sampler restarted.
+static void forked(void) {
+  for (int i = 0; i < SHARDS; i++) {
+    atomic_flag_clear(&live[i].lk); atomic_flag_clear(&stacks[i].lk);
+    for (size_t j = 0; j < live[i].cap; j++) live[i].t[j].v |= live[i].t[j].k ? REACH : 0;
+  }
+  for (size_t i = 0; i < nmm; i++) mm[i].inh = 1;
+  atomic_flag_clear(&mm_lk); atomic_flag_clear(&peak_lk);
+  nsamples = 0;
+  pthread_t t;
+  guard = 1;
+  if (!pthread_create(&t, 0, sampler, 0)) pthread_detach(t);
+  guard = 0;
+}
+
 __attribute__((constructor)) static void init(void) {
   resolve();
   rows = vm((size_t)MAXSTACKS * sizeof(row_t));
   ips_arena = vm((size_t)1 << 33);
   samples = vm((size_t)MAXSAMPLES * 24);
-  mm = vm((size_t)sizeof(map_t) << 20);
+  mm = vm((size_t)sizeof(map_t) << 20); rs = vm((size_t)sizeof(map_t) << 20);
   const char *e = getenv("HEAPTIDE_EVERY");
   if (e && atoi(e) > 0) every_ms = atoi(e);
   if ((e = getenv("HEAPTIDE_DEPTH")) && atoi(e) > 0 && atoi(e) < DEPTH) depth = atoi(e);
   Dl_info me; dladdr((void *)init, &me);
   dl_iterate_phdr(self_cb, me.dli_fbase);
   unw_set_caching_policy(unw_local_addr_space, UNW_CACHE_PER_THREAD);
+  pthread_atfork(0, 0, forked);
   atexit(fin);  // registered first, so it runs after the program's own atexit/static destructors
   ready = 1;
   pthread_t t;

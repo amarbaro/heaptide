@@ -9,7 +9,7 @@ LeakSanitizer's. It also sees HIP device and pinned host memory, Mojo's GPU buff
 which no other leak tool we know of covers on ROCm.
 
 ```
-heaptide run [--gpu] [--py] [--every MS] [--out DIR] -- CMD...      default DIR .work/heaptide
+heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--out DIR] -- CMD...      default DIR .work/heaptide
 heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none]
                     [--growth-limit MIB]
 ```
@@ -59,8 +59,8 @@ The release tarball needs no Mojo: Linux x86-64, glibc 2.34 or newer, and `libun
 (`libunwind8` on Debian/Ubuntu, `libunwind` on Arch/Fedora).
 
 ```
-curl -LO https://github.com/amarbaro/heaptide/releases/download/v0.1.0/heaptide-v0.1.0-linux-x86_64.tar.gz
-tar xzf heaptide-v0.1.0-linux-x86_64.tar.gz && cd heaptide-v0.1.0-linux-x86_64 && ./heaptide run -- CMD...
+curl -LO https://github.com/amarbaro/heaptide/releases/download/v0.1.1/heaptide-v0.1.1-linux-x86_64.tar.gz
+tar xzf heaptide-v0.1.1-linux-x86_64.tar.gz && cd heaptide-v0.1.1-linux-x86_64 && ./heaptide run -- CMD...
 ```
 
 ## Build from source
@@ -71,7 +71,7 @@ You need Linux x86-64, a C compiler, `libunwind` and Mojo 1.1 for the report (on
 only.
 
 ```
-./build.sh          # -> build/libheaptide.so, build/heaptide_report
+./build.sh          # -> build/libheaptide.so, build/heaptide_report (report built for x86-64-v2, not the build CPU)
 ```
 
 GPU targets need ROCm/HIP. Python mode uses the standard library's `tracemalloc`.
@@ -81,8 +81,11 @@ GPU targets need ROCm/HIP. Python mode uses the standard library's `tracemalloc`
 - `--gpu` sets `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE=0` and
   `MODULAR_DEVICE_CONTEXT_HOST_MEMORY_MANAGER_SIZE=0`. Mojo normally sub-allocates from a
   ~490 MiB device pool and a pinned host pool it keeps until exit. Without the flag heaptide sees
-  one big block, and the host pool shows up as a leak.
-- `--py CMD` takes a python command and runs the script under `tracemalloc` with 1 frame. Native
+  one big block, and the host pool shows up as a leak. Leak findings are the same either way;
+  PEAK and peak memory under `--gpu` are those of the unpooled allocator, not of production.
+- `--py CMD` takes a python command and runs the script under `tracemalloc` with 1 frame;
+  `--py-depth N` keeps N frames and shows each site as its call chain (on `tests/py_leak.py`:
+  1.14 s at 1 frame, 1.32 s at 2, 2.24 s at 8). Native
   stacks are capped at 8 frames (`HEAPTIDE_DEPTH`, default 64), because most Python-mode stacks
   are tracemalloc's own and deeper frames only split them.
 - `--every MS` sets the GROWTH sampling period (default 100).
@@ -148,10 +151,11 @@ Internals: [docs/how-it-works.md](docs/how-it-works.md). File format:
 
 ## Every claim above has a check
 
-`tests/run.sh` runs 39 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
+`tests/run.sh` runs 60 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
 exact leak bytes, file:line, the direct/indirect split, mmap regions, blocks held only by a
-thread's stack or register, growth after a long setup, Python lines, and HIP and Mojo GPU leaks.
-`tests/run.sh --cpu` runs the 35 that need no GPU; CI runs those on Ubuntu 24.04 for every push.
+thread's stack or register, interior pointers, fork, reserve-then-commit mappings, growth after a
+long setup, Python lines, and HIP and Mojo GPU leaks. `tests/run.sh --cpu` runs the 56 that need
+no GPU; CI runs those on Ubuntu 24.04 for every push.
 [docs/testing.md](docs/testing.md) lists them.
 
 ## For coding agents
@@ -163,19 +167,27 @@ directory (for Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/
 
 ## Where it is wrong
 
-- No interior-pointer scan: a block reachable only through a pointer into its middle shows as a
-  leak. Measured residue: 2.9 KiB from the HIP runtime, 96 B from Mojo's.
-- Python leaves about 170 KiB unfreed at exit. Those leaks are real: nothing in memory points
-  into them, and LeakSanitizer reports more (472 KB).
+- A pointer into a block's middle keeps it alive, as in LeakSanitizer, so a stray word that
+  happens to fall inside a leaked block hides it. Runtime residue left: 216 B direct and 48 B
+  indirect from the HIP runtime, 1.2 KiB indirect from Mojo's. The ~170 KiB CPython used to show
+  at exit was reached through interior pointers (an object pointer sits past its GC header) and
+  is gone.
 - GPU and pinned host blocks are never scanned for pointers, because the HIP runtime's own
   tables point at all of them. Any GPU or host block unfreed at exit counts as a direct leak.
-- `PROT_NONE` reservations are not counted, nor a later `mprotect` that commits them.
-- A forked child keeps the parent's tables until it calls exec. A `dlsym(RTLD_NEXT, ...)` in the
-  target resolves relative to libheaptide. Two stacks whose 64-bit hashes collide merge into one
-  site.
-- Stripped system libraries show as `[module]` frames; there is no debuginfod lookup.
+- A `PROT_NONE` reservation counts only the parts `mprotect` commits, each as a block at the
+  `mprotect` call; `mprotect(PROT_NONE)` and `madvise(MADV_DONTNEED|MADV_FREE)` decommit. Pages
+  touched again after such a `madvise` without a new `mprotect` are not seen, nor a reservation
+  moved with `mremap`.
+- A forked child treats the parent's blocks as reachable roots, so it reports only its own leaks
+  (LeakSanitizer reports the parent's again in the child). Two stacks whose 64-bit hashes collide
+  merge into one site.
+- Stripped system libraries show as `[module]` frames unless their debug file is in elfutils'
+  cache or `DEBUGINFOD_URLS` is set (then fetched once by build-id; libpython is 33 MB).
 - Linux x86-64 only. GPU paths tested on one machine (Arch Linux, kernel 7.2, glibc 2.44,
-  ROCm 7.2, RX 7900 XTX); CPU paths also on Ubuntu 24.04 (glibc 2.39). Other GPUs untried.
+  ROCm 7.2, RX 7900 XTX); CPU paths also on Ubuntu 24.04 (glibc 2.39), an older Intel laptop
+  (Skylake, Arch) and Ubuntu 24.04 under WSL2 on Windows 11. Other GPUs untried.
+- Windows: no native support (no `LD_PRELOAD`; the report is Mojo, which runs on Linux and
+  macOS only). Linux programs under WSL2 work with the Linux release; GPU under WSL is untried.
 
 ## License
 

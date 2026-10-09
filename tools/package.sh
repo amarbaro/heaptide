@@ -10,6 +10,7 @@ name=heaptide-$ver-linux-x86_64; stage=$here/dist/$name
 rm -rf "$stage"; mkdir -p "$stage/build/lib"
 cp "$here/heaptide" "$here/LICENSE" "$here/NOTICE" "$here/README.md" "$stage/"
 cp "$here/build/libheaptide.so" "$here/build/heaptide_report" "$stage/build/"
+cp -r "$here/py" "$stage/"  # --py runs py/run.py
 ldd "$here/build/heaptide_report" | awk '/=> \// {print $3}' | grep -E '/modular/lib/' | while read -r lib; do
   cp -L "$lib" "$stage/build/lib/"
 done

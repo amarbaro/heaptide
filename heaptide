@@ -38,6 +38,13 @@ if (( py )); then
   export HEAPTIDE_DEPTH=${HEAPTIDE_DEPTH:-8}  # tracemalloc gives the Python lines; native frames past 8 only split sites
   exe=$1; shift; set -- "$exe" -X tracemalloc=$pyd "$here/py/run.py" "$@"
 fi
+# static ASan (clang's default) defines malloc in the program itself, ahead of any preload
+exe=$(command -v "$1" || true)
+[[ -n $exe ]] && command -v nm >/dev/null && nm -D --defined-only "$exe" 2>/dev/null | grep -c ' __asan_init$' >/dev/null &&
+  echo "heaptide: warning: $1 links ASan statically, heaptide cannot see its allocations; rebuild with -shared-libsan (clang) or gcc -fsanitize=address" >&2
+# an ASan-built program refuses to start unless its runtime is preloaded first; heaptide must be,
+# and its hooks hand every call on to ASan's, so the order check is turned off (both then work)
+[[ ${ASAN_OPTIONS:-} == *verify_asan_link_order* ]] || export ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}verify_asan_link_order=0"
 rc=0; LD_PRELOAD="$here/build/libheaptide.so${LD_PRELOAD:+:$LD_PRELOAD}" "$@" || rc=$?
 echo "heaptide: report with: heaptide report $HEAPTIDE_OUT" >&2
 exit $rc

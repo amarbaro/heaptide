@@ -60,8 +60,8 @@ The release tarball needs no Mojo: Linux x86-64, glibc 2.34 or newer, and `libun
 (`libunwind8` on Debian/Ubuntu, `libunwind` on Arch/Fedora).
 
 ```
-curl -LO https://github.com/amarbaro/heaptide/releases/download/v0.1.1/heaptide-v0.1.1-linux-x86_64.tar.gz
-tar xzf heaptide-v0.1.1-linux-x86_64.tar.gz && cd heaptide-v0.1.1-linux-x86_64 && ./heaptide run -- CMD...
+curl -LO https://github.com/amarbaro/heaptide/releases/download/v0.1.3/heaptide-v0.1.3-linux-x86_64.tar.gz
+tar xzf heaptide-v0.1.3-linux-x86_64.tar.gz && cd heaptide-v0.1.3-linux-x86_64 && ./heaptide run -- CMD...
 ```
 
 ## Build from source
@@ -84,7 +84,7 @@ GPU targets need ROCm/HIP. Python mode uses the standard library's `tracemalloc`
   ~490 MiB device pool and a pinned host pool it keeps until exit. Without the flag heaptide sees
   one big block, and the host pool shows up as a leak. Leak findings are the same either way;
   PEAK and peak memory under `--gpu` are those of the unpooled allocator, not of production.
-- `--py CMD` takes a python command and runs the script under `tracemalloc` with 1 frame;
+- `--py CMD` takes a python command (`python script.py ...` or `python -m pkg.module ...`) and runs it under `tracemalloc` with 1 frame;
   `--py-depth N` keeps N frames and shows each site as its call chain (on `tests/py_leak.py`:
   1.14 s at 1 frame, 1.32 s at 2, 2.24 s at 8). Native
   stacks are capped at 8 frames (`HEAPTIDE_DEPTH`, default 64), because most Python-mode stacks
@@ -136,7 +136,7 @@ heaptide run ── LD_PRELOAD ──► libheaptide.so (C, one file, inside the
                          roots: globals · other threads' stacks + registers · linker blocks
                          → each unfreed block is direct, indirect or reachable
                                 ▼
-                       heaptide.<pid>.bin + .maps
+                       heaptide.<pid>.bin (maps inside)
                                 ▼
 heaptide report (Mojo) ── one llvm-symbolizer batch ──► LEAKS · GROWTH · PEAK · HOTSPOTS
                                                         · TEMPORARIES · PYTHON
@@ -164,10 +164,10 @@ Internals: [docs/how-it-works.md](docs/how-it-works.md). File format:
 
 ## Every claim above has a check
 
-`tests/run.sh` runs 112 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
+`tests/run.sh` runs 126 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
 exact leak bytes, file:line, the direct/indirect split, mmap regions, blocks held only by a
 thread's stack or register, interior pointers, fork, reserve-then-commit mappings, growth after a
-long setup, Python lines, and HIP and Mojo GPU leaks. `tests/run.sh --cpu` runs the 108 that need
+long setup, Python lines, and HIP and Mojo GPU leaks. `tests/run.sh --cpu` runs the 122 that need
 no GPU; CI runs those on Ubuntu 24.04 for every push.
 [docs/testing.md](docs/testing.md) lists them.
 
@@ -196,7 +196,10 @@ directory (for Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/
 - A forked child treats the parent's blocks as reachable roots, so it reports only its own leaks
   (LeakSanitizer reports the parent's again in the child). Stack ids are a 64-bit hash plus a
   32-bit check: two sites merge only if all 96 bits collide.
-- Stripped system libraries show as `[module]` frames unless their debug file is in elfutils'
+- An ASan build works when ASan's runtime is shared (gcc's default, clang `-shared-libsan`): both
+  run, heaptide sees every block. clang's default links ASan into the program, whose own `malloc`
+  then wins over any preload: heaptide warns and sees nothing.
+- Stripped system libraries show as `[module+0xoffset]` frames (the offset inside the library, stable per build) unless their debug file is in elfutils'
   cache or `DEBUGINFOD_URLS` is set (then fetched once by build-id; libpython is 33 MB).
 - Linux x86-64 only. GPU paths tested on one machine (Arch Linux, kernel 7.2, glibc 2.44,
   ROCm 7.2, RX 7900 XTX); CPU paths also on Ubuntu 24.04 (glibc 2.39), an older Intel laptop

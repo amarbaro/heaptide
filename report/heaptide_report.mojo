@@ -72,12 +72,9 @@ def hexval(s: StringSlice) raises -> UInt64:
     return v
 
 
-def load_maps(path: String) raises -> List[Mapping]:
+def load_maps(text: String) raises -> List[Mapping]:
     # one Mapping per file: [lowest start, highest end), base = lowest start
     var out = List[Mapping]()
-    var text: String
-    with open(path, "r") as f:
-        text = f.read()
     for line in text.split("\n"):
         var parts = line.split()
         var slash = line.find(" /")  # the path starts at the first " /" (fields 1-5 hold no slash)
@@ -99,21 +96,25 @@ def load_maps(path: String) raises -> List[Mapping]:
 
 
 def top(stacks: List[Stack], key: Int, n: Int, among: List[Int]) -> List[Int]:
-    # indices (from `among`) of the n largest non-zero values of field `key`, largest first
-    var picked = List[Int]()
-    var used = List[Bool](length=len(stacks), fill=False)
-    for _ in range(n):
-        var best = -1
-        var bv: UInt64 = 0
-        for i in among:
-            var v = field(stacks[i], key)
-            if not used[i] and v > bv:
-                best = i
-                bv = v
-        if best < 0:
-            break
-        used[best] = True
-        picked.append(best)
+    # indices (from `among`) of the n largest non-zero values of field `key`, largest first, ties by position
+    var ids = List[Int]()
+    var vals = List[UInt64]()
+    for i in among:
+        var v = field(stacks[i], key)
+        if v > 0:
+            ids.append(i)
+            vals.append(v)
+    var order = List[Int](capacity=len(ids))
+    for j in range(len(ids)):
+        order.append(j)
+
+    def before(a: Int, b: Int) {imm vals} -> Bool:
+        return vals[a] > vals[b] or (vals[a] == vals[b] and a < b)
+
+    sort(order, before)
+    var picked = List[Int](capacity=min(n, len(order)))
+    for j in range(min(n, len(order))):
+        picked.append(ids[order[j]])
     return picked^
 
 
@@ -177,6 +178,7 @@ def symbolize(stacks: List[Stack], wanted: List[Int], maps: List[Mapping], dir: 
     var req = String()
     var keys = List[Int]()
     var mods = List[String]()
+    var offs = List[UInt64]()  # module-relative address: names a frame no symbol table covers
     var exe = String(maps[0].path[byte=maps[0].path.rfind("/") + 1 :]) if len(maps) > 0 else String()
     var fixed = List[Bool]()
     for m in maps:
@@ -190,6 +192,7 @@ def symbolize(stacks: List[Stack], wanted: List[Int], maps: List[Mapping], dir: 
                         req += '"' + m.path + '" 0x' + hex(ip - (0 if fixed[mi] else m.start) - 1)[byte=2:] + "\n"
                         keys.append(w)
                         mods.append(String(m.path[byte=m.path.rfind("/") + 1 :]))
+                        offs.append(ip - (0 if fixed[mi] else m.start))
                     break
     var inp = dir + "/.sym." + pid + ".in"
     var outp = dir + "/.sym." + pid + ".out"
@@ -220,7 +223,7 @@ def symbolize(stacks: List[Stack], wanted: List[Int], maps: List[Mapping], dir: 
         var loc = String(lines[li + 1])
         var func = String(lines[li])
         if func == "??":
-            func = "[" + mods[ki] + "]"
+            func = "[" + mods[ki] + "+0x" + hex(offs[ki])[byte=2:] + "]"
         li += 2
         var n = shown.get(k, 0)
         # user frame: own source file, or (no debug info) a frame in the program's own executable
@@ -349,13 +352,16 @@ def main() raises:
         var nsamp = Int(u64(b, 32))
         var every = u64(b, 40)
         var has_blk = (u64(b, 48) & 1) == 1
+        var has_maps = (u64(b, 48) & 2) == 2  # since v0.1.3 the maps text ends the .bin; older: a .maps file
+        var nmaps = Int(u64(b, 56)) if has_maps and u64(b, 56) < 1 << 31 else 0
         var ips_at = 64
         var rows_at = ips_at + nips * 8
         var dir_at = rows_at + n * ROW
         var ind_at = dir_at + n * 8
         var smp_at = ind_at + n * 8
         var blk_at = smp_at + nsamp * 24
-        if len(b) < blk_at + (n * 8 if has_blk else 0):
+        var maps_at = blk_at + (n * 8 if has_blk else 0)
+        if len(b) < maps_at + nmaps or (has_maps and u64(b, 56) >= 1 << 31):
             print("FAIL report: truncated file", name, file=stderr)
             exit(2)
         var stacks = List[Stack]()
@@ -373,7 +379,13 @@ def main() raises:
                                 u64(b, dir_at + s * 8), u64(b, ind_at + s * 8),
                                 u64(b, blk_at + s * 8) if has_blk else u64(b, r + 24), Int(b[r + 52]), ips^))
 
-        var maps = load_maps(dir + "/heaptide." + pid + ".maps")
+        var maps_text: String
+        if has_maps:
+            maps_text = String(from_utf8_lossy=Span(b)[maps_at : maps_at + nmaps])
+        else:
+            with open(dir + "/heaptide." + pid + ".maps", "r") as f:
+                maps_text = f.read()
+        var maps = load_maps(maps_text)
         var all_ids = List[Int]()
         var leaking = List[Int]()  # all of them: totals and suppressions must not stop at a display cap
         for s in range(len(stacks)):

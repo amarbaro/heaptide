@@ -215,6 +215,8 @@ static void peak_check(int force) {
   for (int i = 0, ns = force || tot - m >= 65536 ? (nslot < SLOTS ? nslot : SLOTS) : 0; i < ns; i++)
     for (int j = 0; j < 16; j++)
       if (lslot[i].pend[j].id && lslot[i].pend[j].id <= n) rows[lslot[i].pend[j].id].peak_b += lslot[i].pend[j].d[4];
+  // a free batched in by another thread can land before the allocation it undoes: never a negative site
+  for (uint32_t i = 1; i <= n; i++) if ((int64_t)rows[i].peak_b < 0) rows[i].peak_b = 0;
   peak_mark = tot;
   atomic_flag_clear(&peak_lk);
 }
@@ -469,13 +471,17 @@ HOOK int hipFree(void *p) { REAL((void *), "hipFree"); uint64_t v = untrack(p); 
 HOOK int hipHostFree(void *p) { REAL((void *), "hipHostFree"); uint64_t v = untrack(p); int e = IN(r(p)); if (e) retrack(p, v, 0); return e; }
 HOOK int hipFreeAsync(void *p, void *s) { REAL((void *, void *), "hipFreeAsync"); uint64_t v = untrack(p); int e = IN(r(p, s)); if (e) retrack(p, v, 0); return e; }
 
+static int same(const char *a, const char *b) { while (*a && *a == *b) a++, b++; return *a == *b; }
+// dlsym can be asked before this library's ifunc slots are bound (ASan's init, run by the loader):
+// no libc string call on this path
 HOOK void *dlsym(void *h, const char *name) {
   static const struct { const char *n; void *f; } ours[] = {
       {"hipMalloc", hipMalloc}, {"hipMallocAsync", hipMallocAsync}, {"hipHostMalloc", hipHostMalloc},
       {"hipFree", hipFree},     {"hipHostFree", hipHostFree},       {"hipFreeAsync", hipFreeAsync}};
   if (!r_dlsym) r_dlsym = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+  if (!r_dlsym) return 0;  // asked before libdl answers (ASan's init, run by the loader): not found
   for (size_t i = 0; i < sizeof ours / sizeof *ours; i++)  // ours only where the real one exists
-    if (!strcmp(name, ours[i].n)) return (h == RTLD_DEFAULT || h == RTLD_NEXT ? next(name) : r_dlsym(h, name)) ? ours[i].f : 0;
+    if (same(name, ours[i].n)) return (h == RTLD_DEFAULT || h == RTLD_NEXT ? next(name) : r_dlsym(h, name)) ? ours[i].f : 0;
   // a tail call keeps the caller's return address, which glibc reads to resolve RTLD_NEXT
   MUSTTAIL return r_dlsym(h, name);
 }
@@ -655,12 +661,23 @@ static void park(int sig, siginfo_t *si, void *ctx) {
       while (!released) nanosleep(&ms, 0);
     }
 }
-static int stop_threads(void) {  // 1 when every other thread is parked
-  int sig = SIGRTMAX - 2, sent = 0;
-  nthr = 0; parked = 0; released = 0;
-  struct sigaction sa = {.sa_sigaction = park, .sa_flags = SA_SIGINFO | SA_RESTART};
+// The park signal: the highest real-time signal from SIGRTMAX-2 down that the program leaves at
+// its default, so a program's own handler is never replaced. Once ours it stays installed (a late
+// delivery must not hit the default, terminate); chosen again if the program takes it back.
+static int park_sig(void) {
+  static int sig;
+  struct sigaction o, sa = {.sa_sigaction = park, .sa_flags = SA_SIGINFO | SA_RESTART};
+  if (sig && !sigaction(sig, 0, &o) && o.sa_sigaction == park) return sig;
+  sig = 0;
+  for (int s = SIGRTMAX - 2; s >= SIGRTMIN + 2 && !sig; s--)
+    if (!sigaction(s, 0, &o) && o.sa_handler == SIG_DFL) sig = s;
   sigfillset(&sa.sa_mask);
-  sigaction(sig, &sa, 0);  // never restored: a late delivery must not hit the default (terminate)
+  if (sig) sigaction(sig, &sa, 0);
+  return sig;
+}
+static int stop_threads(void) {  // 1 when every other thread is parked
+  int sig = park_sig(), sent = 0;
+  nthr = 0; parked = 0; released = 0;  // no free signal: threads listed, none parked (as if blocked)
   if (!thr) thr = vm(MAXTHR * sizeof(thr_t));  // kept: a late park signal still reads it
   DIR *d = opendir("/proc/self/task");
   for (struct dirent *e; d && (e = readdir(d)) && nthr < MAXTHR;)
@@ -670,7 +687,7 @@ static int stop_threads(void) {  // 1 when every other thread is parked
   for (int i = 0; i < nthr; i++) {
     snprintf(path, sizeof path, "/proc/self/task/%d/status", thr[i].tid);
     char *b = slurp(path, buf, sizeof buf) > 0 ? strstr(buf, "SigBlk:") : 0;
-    if (b && !(strtoull(b + 7, 0, 16) >> (sig - 1) & 1) && !syscall(SYS_tgkill, getpid(), thr[i].tid, sig)) sent++;
+    if (sig && b && !(strtoull(b + 7, 0, 16) >> (sig - 1) & 1) && !syscall(SYS_tgkill, getpid(), thr[i].tid, sig)) sent++;
   }
   struct timespec ms = {0, 1000000};
   for (int t = 0; parked < sent && t < 500; t++) nanosleep(&ms, 0);
@@ -710,7 +727,12 @@ static int scan_threads(void) {
 }
 
 static void wr(int fd, const void *p, size_t n) {
-  for (const char *c = p; n;) { ssize_t k = write(fd, c, n); if (k <= 0) return; c += k; n -= k; }
+  for (const char *c = p; n;) {
+    ssize_t k = write(fd, c, n);
+    if (k < 0 && errno == EINTR) continue;
+    if (k <= 0) return;
+    c += k; n -= k;
+  }
 }
 static void unvm(void *p, size_t n) { if (p) syscall(SYS_munmap, p, n); }
 // One report: at exit or on a signal (final), or a snapshot of a running process. Threads are
@@ -815,20 +837,13 @@ static void report(int final) {
     for (size_t i = 0; i < na; i++) all[i]->v = (all[i]->v & ~(uint64_t)(REACH | INDIRECT)) | (was[i] ? REACH : 0);
   released = 1;
 
-  // maps first, then the .bin by rename: a report reading the folder never sees half a file
+  // one file, written as .tmp and renamed: a reader never sees half a report, nor maps from another snapshot
   char path[4200], tmp[4210];
-  snprintf(path, sizeof path, "%s/heaptide.%d.maps", outdir, pid);
-  snprintf(tmp, sizeof tmp, "%s.tmp", path);
-  int in = open("/proc/self/maps", O_RDONLY), out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  char buf[1 << 16];
-  for (ssize_t k; in >= 0 && out >= 0 && (k = read(in, buf, sizeof buf)) > 0;) wr(out, buf, k);
-  if (in >= 0) close(in);
-  if (out >= 0) close(out), rename(tmp, path);
   snprintf(path, sizeof path, "%s/heaptide.%d.bin", outdir, pid);
   snprintf(tmp, sizeof tmp, "%s.tmp", path);
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
-    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms, 1 /* leaked block counts follow the samples */, 0};
+    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms, 3 /* leaked block counts, then maps text */, 0};
     wr(fd, hdr, sizeof hdr);
     wr(fd, ips_arena, ips_used * 8);
     wr(fd, rows + 1, n * sizeof(row_t));
@@ -836,6 +851,12 @@ static void report(int final) {
     wr(fd, indirect + 1, n * 8);
     wr(fd, samples, nsamples * 24);
     wr(fd, blocks + 1, n * 8);
+    int in = open("/proc/self/maps", O_RDONLY);
+    char buf[1 << 16];
+    for (ssize_t k; in >= 0 && ((k = read(in, buf, sizeof buf)) > 0 || (k < 0 && errno == EINTR));)
+      if (k > 0) wr(fd, buf, k), hdr[7] += k;
+    if (in >= 0) close(in);
+    pwrite(fd, &hdr[7], 8, 56);
     close(fd);
     rename(tmp, path);
   }
@@ -874,16 +895,26 @@ static int self_cb(struct dl_phdr_info *in, size_t sz, void *self) {
   return 0;
 }
 
+// fork() holds every lock across the copy (outer first, as the hooks nest them), so the child
+// never inherits a table another thread was halfway through resizing or shifting.
+static void fork_lock(void) {
+  lock(&mm_lk); lock(&peak_lk);
+  for (int i = 0; i < SHARDS; i++) lock(&stacks[i].lk), lock(&live[i].lk);
+}
+static void fork_unlock(void) {
+  for (int i = 0; i < SHARDS; i++) unlock(&live[i].lk), unlock(&stacks[i].lk);
+  unlock(&peak_lk); unlock(&mm_lk);
+}
 // A forked child inherits the parent's blocks: they are the parent's leaks, not the child's, but
-// may hold the only pointer to a child block. Mark them reachable roots; other threads are gone,
-// so their locks are released and the sampler restarted.
+// may hold the only pointer to a child block. Mark them reachable roots. Other threads are gone:
+// their batched site counts are folded in (else the child's frees drive a site negative) and the
+// sampler restarted.
 static void forked(void) {
-  for (int i = 0; i < SHARDS; i++) {
-    atomic_flag_clear(&live[i].lk); atomic_flag_clear(&stacks[i].lk);
+  fork_unlock();
+  flush_all();
+  for (int i = 0; i < SHARDS; i++)
     for (size_t j = 0; j < live[i].cap; j++) live[i].t[j].v |= live[i].t[j].k ? REACH : 0;
-  }
   for (size_t i = 0; i < nmm; i++) mm[i].inh = 1;
-  atomic_flag_clear(&mm_lk); atomic_flag_clear(&peak_lk);
   nsamples = 0;
   pthread_t t;
   guard = 1;
@@ -925,7 +956,7 @@ __attribute__((constructor)) static void init(void) {
   sigfillset(&sa.sa_mask);  // the park signal stays blocked: this thread is not waited for
   for (int i = 0, c[] = {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT}; i < 5; i++)
     if (!sigaction(c[i], 0, &old) && old.sa_handler == SIG_DFL) sigaction(c[i], &sa, 0);
-  pthread_atfork(0, 0, forked);
+  pthread_atfork(fork_lock, fork_unlock, forked);
   atexit(fin);  // registered first, so it runs after the program's own atexit/static destructors
   ready = 1;
   pthread_t t;

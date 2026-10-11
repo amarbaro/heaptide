@@ -25,7 +25,7 @@ waitfor() { local i; for ((i = 0; i < $1 * 20; i++)); do "${@:2}" && return 0; s
 caught() { local p m; p=$(pgrep -nf -- "$1") || return 1; m=$(awk '/^SigCgt/ {print $2}' "/proc/$p/status" 2>/dev/null) || return 1
            (( (16#${m:-0} >> ($2 - 1)) & 1 )); }
 
-for t in c_leak c_reach c_churn c_grow c_flat c_setup c_mmap c_slow c_fork c_interior c_realloc c_peak c_reserve c_signal c_snapshot c_remap c_crash; do cc -O0 -g -o "build/$t" "tests/$t.c"; done
+for t in c_leak c_reach c_churn c_grow c_flat c_setup c_mmap c_slow c_fork c_interior c_realloc c_peak c_reserve c_signal c_snapshot c_remap c_crash c_steady c_forkmt c_rtsig; do cc -O0 -g -o "build/$t" "tests/$t.c"; done
 
 run c_leak -- build/c_leak
 expect c_leak direct "$(sum c_leak direct)" 100005
@@ -51,6 +51,10 @@ has c_grow "GROWTH  FAIL"
 run c_flat --every 20 -- build/c_flat
 has c_flat "GROWTH  PASS"
 expect c_flat direct "$(sum c_flat direct)" 0
+# heaptide's own memory stays flat under a steady program: RSS and VmSize growth from 1 s to 3 s
+# under 1 MiB each (normal: <= 128 KiB; a shim leaking 64 B per 1024 mallocs grows ~21 MiB)
+g=$(./heaptide run --out "$w/c_steady" -- build/c_steady 2>/dev/null | grep -oE '[0-9-]+ [0-9-]+$' || true)
+[[ $g =~ ^-?[0-9]+\ -?[0-9]+$ ]] && (( ${g% *} < 1024 && ${g#* } < 1024 )) && ok "c_steady shim growth $g KiB" || bad c_steady "shim growth '$g' KiB, want both < 1024"
 run c_setup --every 20 -- build/c_setup
 has c_setup "GROWTH  PASS"
 # --growth-limit: a slow leak under the 5% rule fails once an absolute limit is set; a setup that
@@ -72,6 +76,24 @@ has c_mmap "20.0 KiB (direct 20480, indirect 0, 2 blocks) mmap  lose c_mmap.c:12
 run c_fork -- build/c_fork
 expect c_fork child_direct "$(grep -m1 -oE " direct=[0-9]+" "$w/c_fork.err" | cut -d= -f2)" 32
 expect c_fork parent_direct "$(grep -oE " direct=[0-9]+" "$w/c_fork.err" | sed -n 2p | cut -d= -f2)" 64
+# an ASan-built program (shared runtime, gcc's default): heaptide sees every block, ASan still runs;
+# static ASan (clang's default) cannot be watched and gets a warning instead of a silent empty report
+gcc -O0 -g -fsanitize=address -o build/c_leak_asan tests/c_leak.c
+run c_leak_asan -- build/c_leak_asan
+expect c_leak_asan direct "$(sum c_leak_asan direct)" 100005
+has c_leak_asan "lose c_leak.c:3"
+grep -q "LeakSanitizer: detected memory leaks" "$w/c_leak_asan.err" && ok "c_leak_asan ASan still reports" || bad c_leak_asan "no ASan report ($w/c_leak_asan.err)"
+clang -O0 -g -fsanitize=address -o build/c_leak_sasan tests/c_leak.c
+./heaptide run --out "$w/c_leak_sasan" -- build/c_leak_sasan 2> "$w/c_leak_sasan.err" >/dev/null || true
+grep -q "links ASan statically" "$w/c_leak_sasan.err" && ok "c_leak_sasan static ASan warned" || bad c_leak_sasan "no warning ($w/c_leak_sasan.err)"
+# fork while 8 threads churn: children report only their own leak, no site goes negative
+# (a child once inherited a peak taken while another thread's batched free led its allocation)
+run c_forkmt -- build/c_forkmt
+# a child shows its 200000 B leak, never an inherited block (a damaged table would leak those)
+expect c_forkmt children_leak "$(grep -c " direct=200000 " "$w/c_forkmt.err" || true)" 200
+rm -rf "$w/c_forkmt1"; mkdir -p "$w/c_forkmt1"; cp "$(ls "$w"/c_forkmt/heaptide.*.bin | head -1)" "$w/c_forkmt1/"
+./build/heaptide_report "$w/c_forkmt1" > "$w/c_forkmt.txt" 2>&1 || true
+[[ $(cat "$w/c_forkmt.txt") != *"   18446744"* ]] && ok "c_forkmt no negative site" || bad c_forkmt "negative site ($w/c_forkmt.txt)"
 
 # a pointer into a block's middle keeps it alive (LSan agrees: direct 32, indirect 64)
 run c_interior -- build/c_interior
@@ -151,7 +173,12 @@ for tag, n in (("trunc", 1), ("huge", 2**64 - 1)):
 PY
 for t in rep_trunc rep_huge; do rc=0; ./build/heaptide_report "$w/$t" --json >/dev/null 2>&1 || rc=$?; expect $t exit "$rc" 2; done
 for f in "--top" "--typo" "--growth-limit -1"; do rc=0; ./build/heaptide_report "$w/edge_count" $f >/dev/null 2>&1 || rc=$?; expect "report_args($f)" exit "$rc" 2; done
-m=$(ls "$w"/edge_count/*.maps); sed -i 's|/c_edge$|/c\\_e"dge|' "$m"
+python3 - "$w"/edge_count/*.bin <<'PY2'  # the maps text ends the .bin; header field 7 is its length
+import struct, sys
+b = bytearray(open(sys.argv[1], "rb").read()); n = struct.unpack_from("<Q", b, 56)[0]
+m = bytes(b[len(b) - n:]).replace(b"/c_edge\n", b'/c\\_e"dge\n')
+open(sys.argv[1], "wb").write(b[:56] + struct.pack("<Q", len(m)) + b[64:len(b) - n] + m)
+PY2
 { HEAPTIDE_SYMBOLIZER=/nonexistent ./build/heaptide_report "$w/edge_count" --json 2>/dev/null || true; } | python3 -c 'import json,sys; json.load(sys.stdin)' && ok "json escapes backslash and quote" || bad json "invalid JSON for a path with \\ and \""
 # a crash still writes the report and dies of its signal; a program's own handler is left alone
 for a in segv abort overflow own; do
@@ -167,6 +194,12 @@ waitfor 20 caught '^build/c_snapshot$' 15 || true; sleep 0.2  # a few blocks los
 read -r mid blk < <({ ./build/heaptide_report "$w/c_snap" --json 2>/dev/null || true; } | python3 -c "import json,sys; r=json.load(sys.stdin)[0]; print(r['direct'], r['leaks'][0]['blocks'])" 2>/dev/null || true)
 wait $p || true
 (( ${mid:-0} > 0 && ${mid:-0} < 40960 )) && ok "c_snapshot mid-run direct $mid" || bad c_snapshot "mid-run report direct '$mid', want 0 < x < 40960"
+# the program's own SIGRTMAX-2 handler survives a snapshot (threads park on a free RT signal)
+rm -rf "$w/c_rtsig"; ./heaptide run --out "$w/c_rtsig" -- build/c_rtsig > "$w/c_rtsig.out" 2> "$w/c_rtsig.err" & p=$!
+waitfor 20 grep -qs held "$w/c_rtsig.out" || true; ./heaptide snapshot "$w/c_rtsig" >/dev/null 2>&1
+rc=0; wait $p || rc=$?
+expect c_rtsig own_handler_rc "$rc" 0
+grep -q "snapshot skipped" "$w/c_rtsig.err" && bad c_rtsig "snapshot skipped ($w/c_rtsig.err)" || ok "c_rtsig snapshot not skipped"
 expect c_snapshot mid_blocks "${blk:-}" "$(( ${mid:-0} / 1024 ))"  # row counters flushed in the snapshot
 expect c_snapshot final_direct "$(grep -v snapshot "$w/c_snap.err" | grep -m1 -oE " direct=[0-9]+" | cut -d= -f2)" 40960
 # no process can be forked (RLIMIT_NPROC): the snapshot scans in place and undoes its marks
@@ -223,6 +256,15 @@ expect demo json "$(python3 -c 'import json,sys;d=json.loads(sys.argv[1])[0];l=d
 printf 'demo.c:10\n' > "$w/supp"
 j=$(./build/heaptide_report "$w/demo" --json --supp "$w/supp" 2>/dev/null || true)
 expect demo json_supp "$(python3 -c 'import json,sys;d=json.loads(sys.argv[1])[0];print(d["indirect"],len(d["leaks"]))' "$j" 2>&1)" "0 1"
+# heaptide on its own report: no leak outside the Mojo runtime, whose 2 MiB pool appears on large
+# dumps (tests/self.supp; checked: that dump fails without it, passes with it). The report's helpers, sort and the
+# symbolizer, write their own files: keep only the one whose maps name heaptide_report.
+rm -rf "$w/self" "$w/self1"; mkdir -p "$w/self1"
+./heaptide run --out "$w/self" -- ./build/heaptide_report "$w/demo" >/dev/null 2>&1 || true
+sb=$(grep -l heaptide_report "$w"/self/heaptide.*.bin | head -1 || true); [[ -n $sb ]] && cp "$sb" "$w/self1/"
+rc=0; ./build/heaptide_report "$w/self1" --supp tests/self.supp --fail-on leaks > "$w/self.txt" 2>&1 || rc=$?
+expect self fail_on_leaks "$rc" 0
+has self "exe $here/build/heaptide_report"
 # symbolizer lookup: none found -> modules only, never a crash; one on PATH wins over ROCm's
 HEAPTIDE_SYMBOLIZER=/nonexistent ./build/heaptide_report "$w/demo" --top 1 > "$w/nosym.txt" 2>&1 || true
 has nosym "sites show modules only"
@@ -235,7 +277,11 @@ expect failon bad_value_exit "$rc" 2
 mkdir -p "$w/it's"; cp "$w"/demo/heaptide.* "$w/it's/"
 ./build/heaptide_report "$w/it's" > "$w/quote.txt" 2>&1 || true
 has quote "handle_request demo.c:9"
-has nosym "100 blocks) cpu  [demo]"
+has nosym "100 blocks) cpu  [demo+0x"
+# the offset is the frame's place in the module: the symbolizer maps it back to the allocating function
+off=$(grep -m1 -oE "100 blocks\) cpu  \[demo\+0x[0-9a-f]+" "$w/nosym.txt" | grep -oE "0x[0-9a-f]+$" || true)
+sy=$(command -v llvm-symbolizer || echo /opt/rocm/llvm/bin/llvm-symbolizer)
+expect nosym offset_symbolizes "$([[ -n $off && -x $sy ]] && "$sy" --obj=build/demo "$off" | head -1)" handle_request
 real=$(command -v llvm-symbolizer || echo /opt/rocm/llvm/bin/llvm-symbolizer)
 mkdir -p "$w/bin"; printf '#!/bin/sh\necho used > "%s/bin/used"\nexec %s "$@"\n' "$PWD/$w" "$real" > "$w/bin/llvm-symbolizer"
 chmod +x "$w/bin/llvm-symbolizer"; PATH="$PWD/$w/bin:$PATH" ./build/heaptide_report "$w/demo" --top 1 > /dev/null 2>&1 || true
@@ -249,25 +295,28 @@ if python3 -c "import numpy" 2>/dev/null; then
   # (symbolized or not depends on the machine's debug info, so either form passes)
   grep -qE "PyArray_NewFromDescr|_multiarray_umath" "$w/py_leak.txt" && ok "py_leak shows numpy's frames" || bad py_leak "no numpy frame ($w/py_leak.txt)"
   [[ -z ${DEBUGINFOD_URLS:-} ]] || has py_leak "obmalloc.c"
+  run py_mod --py -- python3 -m tests.py_leak  # python -m: the same planted lines through runpy.run_module
+  has py_mod "py_leak.py:6"
+  has py_mod "py_leak.py:7"
   run py_deep --py --py-depth 2 -- python3 tests/py_deep.py
   has py_deep "py_deep.py:4 <- "
   has py_deep "py_deep.py:6"
   # --py keeps its PYTHON section on SIGTERM and next to a snapshot
   rm -rf "$w/py_snap" "$w/py_term"
-  ./heaptide run --py --out "$w/py_snap" -- python3 tests/py_hold.py 2>/dev/null & p=$!
-  waitfor 30 caught 'tests/py_hold.py' 15 || true; ./heaptide snapshot "$w/py_snap" 2>/dev/null
+  ./heaptide run --py --out "$w/py_snap" -- python3 tests/py_hold.py >"$w/py_snap.out" 2>/dev/null & p=$!
+  waitfor 30 grep -qs held "$w/py_snap.out" || true; ./heaptide snapshot "$w/py_snap" 2>/dev/null
   waitfor 30 bash -c "grep -qs 'py_hold.py:2' $w/py_snap/py.*.txt" && ok "py_snapshot PYTHON written while running" || bad py_snapshot "no PYTHON section after a snapshot ($w/py_snap)"
   rc=0; pkill -TERM -f '^python3 .*tests/py_hold.py' || true; wait $p || rc=$?
   # a SIGTERM while Python is still starting is held until the runner is ready: both sections
-  rm -rf "$w/py_early"; ./heaptide run --py --out "$w/py_early" -- python3 tests/py_hold.py 2>/dev/null & p=$!
+  rm -rf "$w/py_early"; ./heaptide run --py --out "$w/py_early" -- python3 tests/py_hold.py >/dev/null 2>&1 & p=$!
   for ((i = 0; i < 2000; i++)); do caught 'tests/py_hold.py' 15 && break; sleep 0.005; done
   rc=0; pkill -TERM -f '^python3 .*tests/py_hold.py' || true; wait $p || rc=$?
   expect py_early exit "$rc" 143
   ls "$w"/py_early/py.*.txt >/dev/null 2>&1 && ok "py_early PYTHON section" || bad py_early "no PYTHON section ($w/py_early)"
   # ready = the runner's own handler is installed; a snapshot's PYTHON section proves it (SigCgt
   # cannot: the shim's handler is there before Python starts)
-  ./heaptide run --py --out "$w/py_term" -- python3 tests/py_hold.py 2>/dev/null & p=$!
-  waitfor 30 caught 'tests/py_hold.py' 15 || true; ./heaptide snapshot "$w/py_term" 2>/dev/null
+  ./heaptide run --py --out "$w/py_term" -- python3 tests/py_hold.py >"$w/py_term.out" 2>/dev/null & p=$!
+  waitfor 30 grep -qs held "$w/py_term.out" || true; ./heaptide snapshot "$w/py_term" 2>/dev/null
   waitfor 30 bash -c "grep -qs 'py_hold.py:2' $w/py_term/py.*.txt" || true; rm -f "$w"/py_term/py.*.txt
   rc=0; pkill -TERM -f '^python3 .*tests/py_hold.py' || true; wait $p || rc=$?
   expect py_term exit "$rc" 143

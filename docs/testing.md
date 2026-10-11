@@ -6,8 +6,8 @@ allocation counts, LeakSanitizer (`clang -fsanitize=leak`) for the direct/indire
 reachability. The script prints `PASS N/N`, or `FAIL k/N <names>` and exits non-zero.
 
 ```
-tests/run.sh                    # everything, GPU included: PASS 112/112
-tests/run.sh --cpu              # CPU checks only: PASS 108/108 (cpu only: GPU checks not run)
+tests/run.sh                    # everything, GPU included: PASS 126/126
+tests/run.sh --cpu              # CPU checks only: PASS 122/122 (cpu only: GPU checks not run)
 HEAPTIDE_NO_GPU=1 tests/run.sh  # GPU checks skipped and counted as FAIL
 taskset -c 0 tests/run.sh --cpu # one CPU: the signal and snapshot checks poll, never sleep-guess
 GPU_ARCH=gfx90a tests/run.sh    # override the GPU target (default: first gfx* from rocminfo)
@@ -30,6 +30,7 @@ older CPU (it caught a report built for the build machine's CPU) and under WSL2 
 | `c_churn.c` | 1000 temporaries, 100 MiB burst, 50000-allocation loop | temporaries 1001, `temp_site` is the top temporary, `burst_site` the peak, `hot_site` the hotspot |
 | `c_grow.c` | 1 KiB lost per ms for 2 s | GROWTH FAIL |
 | `c_flat.c` | pool filled, then flat churn | GROWTH PASS, direct 0 |
+| `c_steady.c` | 1000 live blocks, one replaced per iteration for 3 s; prints its own RSS and VmSize growth from 1 s to 3 s | heaptide's own memory: both under 1 MiB (normal <= 128 KiB; a shim leaking 64 B per 1024 mallocs grows ~21 MiB) |
 | `c_setup.c` | 64 MiB setup over a third of the run, then flat churn | GROWTH PASS (the growth window skips the setup) |
 | `c_slow.c` | 64 MiB held, 1 KiB lost per ms (a 3% rise) | GROWTH PASS by default, FAIL with `--growth-limit 1`; `c_setup` still PASSes with that limit |
 | `c_mmap.c` | anonymous mappings: lost, partly unmapped, mremapped, reachable; a 1 MiB malloc | direct 1097728, live mmap 57344, the split mapping reported as 2 blocks at `c_mmap.c:12` |
@@ -49,11 +50,15 @@ older CPU (it caught a report built for the build machine's CPU) and under WSL2 
 | `hip_mock.c` | fake `libamdhip64` whose `hipFree` fails | the block stays live (live_gpu 4096) |
 | report inputs | truncated `.bin`, impossible counts, `--top` without value, unknown flag, negative `--growth-limit`, a module path with `\\` and `"` | exit 2 each; `--json` parses |
 | `c_snapshot.c` | loses 1 KiB every 50 ms for 2 s | `heaptide snapshot` at 1 s: 0 < direct < 40960; final 40960; the snapshot's block count = direct / 1024 (batched counters flushed); `--snapshot-every` writes >= 2; with `prlimit --nproc=1` (no fork) the in-place snapshot still works and final stays 40960 |
+| `c_rtsig.c` | installs its own `SIGRTMAX-2` handler, one idle thread, prints `held`, raises the signal after 3 s | a snapshot in between leaves the program's handler in place (exit 0) and is not skipped |
 | `c_remap.c` | a reservation grown and moved with `mremap`, then committed | live mmap 2097152, direct 1048576 |
 | generated `c20.c` | 20 leaking sites under a shim with a 4-bit stack hash | same site count as the normal shim (19; 8 without the check hash) |
 | `c_fork.c` | parent and child each lose a block; the child links a block only from a parent block | child direct 32, parent direct 64 (LSan reports 96 in the child: deliberate) |
+| `c_leak.c` under ASan | gcc `-fsanitize=address` (shared runtime); clang's static runtime | gcc build: exact 100005 B and `lose c_leak.c:3`, ASan's own leak report still printed; clang build: the static-ASan warning |
+| `c_forkmt.c` | 8 threads swap blocks in shared slots while main forks 200 times; each child leaks 200000 B at `lose_child` (a fresh mapping: a 40 B chunk could reuse an address a dead worker still held) and frees every slot | every child reports exactly 200000 B direct; no site with negative peak bytes |
 | `py_leak.py` | Python objects and numpy buffers kept alive | PYTHON lines 6 and 7; numpy's native frames; output file < 8 MB |
-| `py_hold.py` | holds 8 MiB at line 2, sleeps | `heaptide snapshot`: PYTHON section written while running; SIGTERM: exit 143 and `py_hold.py:2`; SIGTERM during startup: exit 143 and a PYTHON section |
+| `py_hold.py` | holds 8 MiB at line 2, prints `held` (tests wait on it, not on the SIGTERM handler), sleeps | `heaptide snapshot`: PYTHON section written while running; SIGTERM: exit 143 and `py_hold.py:2`; SIGTERM during startup: exit 143 and a PYTHON section |
+| `self.supp` | suppresses `libAsyncRTRuntimeGlobals.so` (Mojo runtime pool, 2 MiB on large dumps) | `self`: heaptide on its own `heaptide_report` (reporting `demo`), `--fail-on leaks` exits 0 |
 | `py_deep.py` | a leak two Python calls deep, `--py-depth 2` | PYTHON site `py_deep.py:4 <- py_deep.py:6` |
 | `hip_leak.hip` | 5 MiB of `hipMalloc` never freed | live GPU 5242880 at `hip_leak.hip:4` |
 | `mojo_leak.mojo` | a 4 MiB device buffer leaked | live GPU 4194304 at `mojo_leak.mojo:8` |

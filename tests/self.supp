@@ -1,0 +1,4 @@
+# Mojo runtime: its worker pool (2 MiB mmap) is never unmapped at exit, not heaptide code
+libAsyncRTRuntimeGlobals.so
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 AMARBARO · amarbaro.org labs

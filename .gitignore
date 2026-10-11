@@ -2,3 +2,4 @@ build/
 .work/
 .venv
 dist/
+__pycache__/

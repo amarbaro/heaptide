@@ -82,7 +82,7 @@ when the question is "where does memory go", not "what leaked".
 
 - Run GPU jobs the way the project schedules its GPU (a queue, a lock); heaptide does not.
 - A forked child keeps the parent's tables until exec; trust exec'd children, not fork-only ones.
-- No `llvm-symbolizer` on the machine: sites show `[module]` only and the report says so. Install
+- No `llvm-symbolizer` on the machine: sites show `[module+0xoffset]` only and the report says so. Install
   LLVM or set `HEAPTIDE_SYMBOLIZER`.
 - Overhead is about 25x on allocation-bound loops; time-sensitive bugs may hide under it.
 - Linux x86-64 only.

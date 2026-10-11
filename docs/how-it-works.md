@@ -104,7 +104,7 @@ has one.
 
 0. **List the loaded objects' writable segments** (`dl_iterate_phdr`) while the other threads
    still run: a thread parked inside the loader would hold the lock that call needs.
-1. **Park the other threads.** Each thread listed in `/proc/self/task` gets `SIGRTMAX-2`. The
+1. **Park the other threads.** Each thread listed in `/proc/self/task` gets the park signal: the highest real-time signal from `SIGRTMAX-2` down that the program left at its default (a program's own handler is never replaced). The
    handler saves the thread's registers from its `ucontext` and waits until classification ends.
    A thread that blocks the signal is not signalled; its stack pointer comes from
    `/proc/self/task/<tid>/syscall`, with no registers. LeakSanitizer stops threads with ptrace
@@ -127,7 +127,7 @@ has one.
 3. **Flood.** Each reachable block's contents are scanned the same way.
 4. **Classify.** For every block still unreached, its contents are scanned with the INDIRECT
    mark. Blocks found only that way are indirect leaks; the rest are direct.
-5. **Write** the `.bin` and `.maps` files, then release the parked threads.
+5. **Write** the `.bin` file (maps text at its end), then release the parked threads.
 
 Stacks and mappings are copied 64 pages per `process_vm_readv` call instead of read in place.
 Recent glibc installs thread-stack guard pages with `MADV_GUARD_INSTALL`, so neighbouring stacks

@@ -9,8 +9,10 @@ LeakSanitizer's. It also sees HIP device and pinned host memory, Mojo's GPU buff
 which no other leak tool we know of covers on ROCm.
 
 ```
-heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--out DIR] -- CMD...
+heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline PARTS] [--out DIR] -- CMD...
 heaptide snapshot DIR                                  a running process writes its report now
+heaptide diff BASE NEW [--fail-on new|grown|none] [--json] [--top N]   exit 1 on a new leak site
+heaptide attach PID [--out DIR]                        a running process, no restart (gdb; sudo under Yama 1)
 heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none]
                     [--growth-limit MIB]
 ```
@@ -47,7 +49,9 @@ TEMPORARIES (alloc then free)
   points to it.
 - **GROWTH**: whether live memory keeps rising after setup. It passes here because 19 KiB over
   two seconds is under the 64 KiB threshold.
-- **PEAK**: which sites held memory at the moment of the peak.
+- **PEAK**: which sites held memory at the moment of the peak, and under each, who holds it now:
+  `held by: make_table c_cache.c:7 << global g_cache`, the chain from a global or a thread's
+  stack down to the site. Growth that is still reachable (a cache, a queue) gets its owner named.
 - **HOTSPOTS**: which sites allocate most often.
 - **TEMPORARIES**: which allocations are freed straight after, with nothing in between.
 
@@ -60,8 +64,8 @@ The release tarball needs no Mojo: Linux x86-64, glibc 2.34 or newer, and `libun
 (`libunwind8` on Debian/Ubuntu, `libunwind` on Arch/Fedora).
 
 ```
-curl -LO https://github.com/amarbaro/heaptide/releases/download/v0.1.3/heaptide-v0.1.3-linux-x86_64.tar.gz
-tar xzf heaptide-v0.1.3-linux-x86_64.tar.gz && cd heaptide-v0.1.3-linux-x86_64 && ./heaptide run -- CMD...
+curl -LO https://github.com/amarbaro/heaptide/releases/download/v0.1.4/heaptide-v0.1.4-linux-x86_64.tar.gz
+tar xzf heaptide-v0.1.4-linux-x86_64.tar.gz && cd heaptide-v0.1.4-linux-x86_64 && ./heaptide run -- CMD...
 ```
 
 ## Build from source
@@ -164,10 +168,12 @@ Internals: [docs/how-it-works.md](docs/how-it-works.md). File format:
 
 ## Every claim above has a check
 
-`tests/run.sh` runs 126 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
+`tests/run.sh` runs 165 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
 exact leak bytes, file:line, the direct/indirect split, mmap regions, blocks held only by a
 thread's stack or register, interior pointers, fork, reserve-then-commit mappings, growth after a
-long setup, Python lines, and HIP and Mojo GPU leaks. `tests/run.sh --cpu` runs the 122 that need
+long setup, Python lines, HIP and Mojo GPU leaks, Mojo's CPU heap, who holds reachable memory, ASan
+programs, attaching to a running process, `diff`, the GPU timeline and Python frames in native
+stacks. `tests/run.sh --cpu` runs the 160 that need
 no GPU; CI runs those on Ubuntu 24.04 for every push.
 [docs/testing.md](docs/testing.md) lists them.
 
@@ -196,6 +202,37 @@ directory (for Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/
 - A forked child treats the parent's blocks as reachable roots, so it reports only its own leaks
   (LeakSanitizer reports the parent's again in the child). Stack ids are a 64-bit hash plus a
   32-bit check: two sites merge only if all 96 bits collide.
+- Mojo allocates through a tcmalloc bundled in its runtime, which no malloc hook sees. heaptide
+  flips the runtime's own sanitizer switch at start, so a Mojo program under heaptide allocates
+  from libc instead: its blocks are tracked like C ones (a grammar test: 2.1 s bare, 1.9 s with
+  the switch alone, 4.0 s profiled), and the tcmalloc arena is never mapped.
+- A snapshot never signals a thread that is asleep in a system call (a signal would end its
+  `nanosleep`/`poll` early): its stack is scanned from `/proc`, but its saved registers are not,
+  so a block held only in such a register shows as leaked in that snapshot (never at exit).
+- Under `--py` with Python 3.12 or newer, native and GPU sites name the Python function that
+  made them (`... <- ffi_call_int <- py::load_weights train.py`): heaptide starts Python with
+  `-X perf`, whose per-function stubs are ordinary native frames, and names them from
+  `/tmp/perf-<pid>.map` (so the report must run on the same machine). Function names only: the
+  PYTHON section keeps the line numbers. A HIP library loaded `RTLD_LOCAL` (ctypes) is tracked too.
+- `heaptide attach PID` loads heaptide into a running process through gdb (`dlopen`), then points
+  every already-bound GOT slot of a hooked function at heaptide's. It sees only what is allocated
+  after attach. Memory from before attach is scanned as a root (minus the blocks tracked since),
+  so nothing from before shows as a leak, but a stale pointer there can hide a newer one: an
+  attached report can under-report, never over-report. Mojo's heap stays invisible when attached
+  (its allocator switch only works before the first allocation). Under Yama `ptrace_scope` 1 it
+  needs `sudo`, or a process that called `prctl(PR_SET_PTRACER, ...)`; `heaptide snapshot DIR`
+  then works as for `run`.
+- `heaptide diff BASE NEW` compares two report dirs site by site, matched by their function chain
+  without line numbers (a change that only moves code keeps its sites): NEW leak sites, GROWN
+  (direct or peak up by more than 64 KiB and 10%, a new big peak site included), GONE, SHRUNK.
+  Without llvm-symbolizer, frames are `[module+offset]`, which moves with every build: `diff` warns
+  and is then only meaningful between identical binaries. It fails (exit 1) on NEW by default, on NEW or GROWN with `--fail-on grown`: a CI gate. Only the
+  sites a report shows are compared (every leak, the top N peaks): raise `--top` to widen it.
+- `--gpu-timeline` (off by default) draws VRAM per site over the run: `sites`, `streams`
+  (`hipMallocAsync` split by stream) and `frag` (device memory in use beyond the live blocks:
+  pooling, alignment, fragments, from `hipMemGetInfo` against its value before the first
+  allocation, so another process allocating on the same GPU shows up there too; plus the async
+  pool's reserved-but-unused bytes). `all` turns on the three.
 - An ASan build works when ASan's runtime is shared (gcc's default, clang `-shared-libsan`): both
   run, heaptide sees every block. clang's default links ASan into the program, whose own `malloc`
   then wins over any preload: heaptide warns and sees nothing.

@@ -1,4 +1,4 @@
-# Mojo runtime: its worker pool (2 MiB mmap) is never unmapped at exit, not heaptide code
+# Mojo runtime: tcmalloc's 2 MiB arena, seen only on heaptide before 0.1.4 (Mojo now allocates from libc under heaptide)
 libAsyncRTRuntimeGlobals.so
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 AMARBARO · amarbaro.org labs

@@ -15,6 +15,10 @@ for f in heaptide build.sh $(git ls-files 'shim/*.c' 'report/*.mojo' 'py/*.py' '
   grep -q "Copyright" "$f" || say "no copyright header: $f"
 done
 for f in LICENSE NOTICE README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md CHANGELOG.md; do [ -f "$f" ] || say "missing $f"; done
+# every subcommand and flag in the launcher's usage reaches the README and the agent skill
+for w in $(grep -m1 'echo "usage:' heaptide | grep -oE '(heaptide [a-z]+|--[a-z][a-z-]+)' | sed 's/^heaptide //' | sort -u); do
+  for d in README.md skills/heaptide/SKILL.md; do grep -qF -- "$w" "$d" || say "$d does not mention $w"; done
+done
 for n in docs/releases/v*.md; do v=$(basename "$n" .md); grep -q "\[$v\]" CHANGELOG.md || say "CHANGELOG has no line for $v"; done
 [ "$fail" = 0 ] && echo "publish-check: OK ($(git rev-parse --short HEAD))"
 exit $fail

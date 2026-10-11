@@ -31,6 +31,42 @@ A thread-local counter marks calls into the real allocators. A mapping made whil
 and is not counted again. glibc's own malloc calls mmap internally and is never seen. The shim's
 own memory comes from raw `syscall(SYS_mmap)`.
 
+**Python in native stacks.** `--py` on Python 3.12+ adds `-X perf`: CPython then runs every Python
+function through a small generated stub, one per code object, and lists the stubs in
+`/tmp/perf-<pid>.map`. The stubs are native frames, so the stacks heaptide already records contain
+them with no extra work per allocation; the report names any frame that falls in no file mapping
+but in a stub range as `py::function file.py`, and counts it as the program's own frame.
+
+**Diff.** `heaptide diff BASE NEW` runs `report --sites` on each dir: one tab-separated line per
+site the report shows (direct, indirect, peak, live, kind, site), then `report --diff` keys both
+on kind plus the site with every `:line:col` removed and compares. Nothing is re-analysed: it
+costs two reports (two 65 536-site reports: 2.7 s).
+
+**Attach.** `heaptide attach PID` has gdb call `setenv` (output dir, attach flag) and `dlopen` in
+the target. The constructor then cannot rely on interposition: the program's GOT slots were bound
+before the library existed. It walks every loaded object's `DT_JMPREL` and `DT_RELA` relocations
+(`JUMP_SLOT`, `GLOB_DAT`) and writes its own address into each slot that names a hooked function
+(its own definitions come from its own `dlopen` handle, since a plain `&malloc` would bind to
+libc's). It also records the writable anonymous mappings and `[heap]` present at that moment: at
+report time they are scanned as roots, skipping the blocks tracked since attach, so a block that
+is reachable only through older memory is not reported as lost.
+
+**GPU timeline.** With `--gpu-timeline`, GPU and pinned-host rows skip the per-thread batch (so
+their counts are current) and each new such row is added to a watch list. Every sample, the
+sampler appends `{sample, row, bytes}` for each watched row whose live bytes moved: 16 B per
+change, nothing for a quiet row. `streams` interns `hipMallocAsync`'s stream as one more frame
+(bit 63 set), so each (site, stream) is its own row. `frag` adds two pseudo rows: device bytes in
+use (`hipMemGetInfo`) minus the live GPU blocks, against the value read just before the program's
+first GPU allocation, and the default pool's reserved minus used bytes. The sampler only calls
+HIP once the program has allocated on the GPU, so it never initialises HIP for a program.
+
+**Mojo's heap.** Mojo code allocates through `KGEN_CompilerRT_AlignedAlloc`, which jumps through a
+function pointer to a tcmalloc bundled in the runtime; malloc hooks never see those blocks, only
+tcmalloc's 2 MiB arena mapping. The runtime exports `KGEN_CompilerRT_SetAsanAllocators()`, a
+sanitizer switch that points that function pointer at libc `malloc`/`aligned_alloc`/`free`.
+heaptide's constructor calls it before Mojo allocates (a block from tcmalloc must never reach
+libc `free`), so every Mojo allocation passes through the hooks above.
+
 ## Per allocation
 
 1. `unw_backtrace` (libunwind, per-thread cache) collects up to 64 return addresses. The shim's
@@ -104,7 +140,11 @@ has one.
 
 0. **List the loaded objects' writable segments** (`dl_iterate_phdr`) while the other threads
    still run: a thread parked inside the loader would hold the lock that call needs.
-1. **Park the other threads.** Each thread listed in `/proc/self/task` gets the park signal: the highest real-time signal from `SIGRTMAX-2` down that the program left at its default (a program's own handler is never replaced). The
+1. **Park the other threads.** (For a snapshot, a thread asleep in a system call is left asleep:
+   the park signal would end its `nanosleep`, `poll` or `epoll_wait` with EINTR, and a program
+   that does not retry, like Mojo's `sleep`, then runs on. Its stack pointer comes from
+   `/proc/self/task/<tid>/syscall`; its saved registers are not scanned.)
+    Each thread listed in `/proc/self/task` gets the park signal: the highest real-time signal from `SIGRTMAX-2` down that the program left at its default (a program's own handler is never replaced). The
    handler saves the thread's registers from its `ucontext` and waits until classification ends.
    A thread that blocks the signal is not signalled; its stack pointer comes from
    `/proc/self/task/<tid>/syscall`, with no registers. LeakSanitizer stops threads with ptrace
@@ -137,6 +177,14 @@ pages and continue.
 
 GPU and pinned host blocks are never scanned, and nothing scanned can reach them: the HIP
 runtime's own tables point at every one of them. One left unfreed at exit is a direct leak.
+
+**Who holds it.** While the scan floods from the roots, the first time a block of a site is
+reached it records what reached it: the site of the block being scanned, or the root (the address
+of a global's word, or "a thread"). One u64 per site, not per block: 65 536 sites cost 512 KiB, and
+10M blocks would have cost 40 MB for a per-block parent. The report follows these links from each
+PEAK site up to a root (at most 6 hops) and names the global with llvm-symbolizer's `DATA` lookup,
+in the same batch as the frames. It is the first path found, not every path: a block reachable two
+ways shows one of them.
 
 ## The report
 

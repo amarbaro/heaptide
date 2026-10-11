@@ -19,6 +19,8 @@ With `--py`, `py.<pid>.txt` adds the PYTHON section as text.
 | ... | 8 × `n` | indirect leaked bytes per stack |
 | ... | 24 × `nsamples` | live-byte samples |
 | ... | 8 × `n` | leaked blocks per stack (only when header field 6 has bit 0 set) |
+| ... | 8 × `n` | retention, per stack: its first holder, a stack id (1-based), `1<<63 \| address` of the global word that reached it, `1<<62` a thread's stack or registers, 0 none (only when header field 6 has bit 2 set) |
+| ... | 8 + 16 × `count` | GPU timeline (only when header field 6 has bit 3 set): u64 `count`, then per change `u64 sample << 32 \| id`, `u64 live bytes`; id `0xFFFFFFFF` = device bytes in use beyond the live blocks, `0xFFFFFFFE` = async pool reserved minus used |
 | ... | field 7 | `/proc/self/maps` text (only when header field 6 has bit 1 set) |
 
 Header (u64 each):
@@ -31,7 +33,7 @@ Header (u64 each):
 | 3 | `nips`, number of instruction pointers |
 | 4 | `nsamples` |
 | 5 | sampling period in ms |
-| 6 | flags: bit 0 = leaked block counts follow the samples (since v0.1.2; older files: the report shows live blocks); bit 1 = maps text ends the file (since v0.1.3) |
+| 6 | flags: bit 0 = leaked block counts follow the samples (since v0.1.2; older files: the report shows live blocks); bit 1 = maps text ends the file (since v0.1.3); bit 2 = the retention array follows the leaked block counts (since v0.1.4); bit 3 = the GPU timeline follows it (`--gpu-timeline`, since v0.1.4) |
 | 7 | length of the maps text in bytes (0 without bit 1) |
 
 Row (56 B, `row_t` in `shim/heaptide.c`, size fixed by a static assert):

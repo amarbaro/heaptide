@@ -1,6 +1,6 @@
 ---
 name: heaptide
-description: Find and fix memory leaks and memory growth in CPU, GPU (HIP, Mojo) and Python programs on Linux with heaptide, a preload profiler that needs no rebuild. Use when a process's memory grows, when a run must be proven leak-free, when VRAM is not returned, or when asked who holds memory at the peak. Covers running it, reading the JSON report, telling real leaks from runtime residue, and proving a fix.
+description: Find and fix memory leaks and memory growth in CPU, GPU (HIP, Mojo) and Python programs on Linux with heaptide, a preload profiler that needs no rebuild. Use when a process's memory grows, when a run must be proven leak-free, when VRAM is not returned, when asked who holds memory, when a running service must be profiled without a restart, or when a change must be gated against its base in CI. Covers running and attaching, reading the JSON report (leaks, holders, GPU timeline), diffing two runs, telling real leaks from runtime residue, and proving a fix.
 ---
 
 # heaptide
@@ -16,13 +16,20 @@ JSON, not the text: it is the stable interface.
    the run.
 2. **Run.**
    ```
-   heaptide run [--gpu] [--py] [--py-depth N] [--every MS] --out .work/ht -- <cmd> <args>
+   heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--gpu-timeline all] --out .work/ht -- <cmd> <args>
    heaptide report .work/ht --json > .work/ht/report.json
    ```
+   - Already running and must not restart: `sudo heaptide attach PID --out .work/ht` (gdb loads
+     heaptide into it), then `heaptide snapshot .work/ht`. It sees only what is allocated after
+     attach and can under-report (never over-report); Mojo's heap stays invisible when attached.
+   - `--gpu-timeline all` (or `sites,streams,frag`) when the question is which GPU site filled VRAM
+     when, per HIP stream, or how much the device holds beyond live blocks.
    - Build C/C++ with `-g` and Mojo with `-g1` (full `-g` can fail on large kernels), or sites
      stop at the executable's symbol.
    - `--gpu` for any Mojo GPU program. Without it Mojo pools its buffers and you see one block.
-   - `--py` for a Python entry point (the command must be `python...`). Add `--py-depth 4` when
+   - `--py` for a Python entry point (the command must be `python...`). On Python 3.12+ native and
+     GPU sites end in the Python function that made them (`<- py::load_weights train.py`); the
+     report must run on the same machine (it reads `/tmp/perf-<pid>.map`). Add `--py-depth 4` when
      one helper is called from many places: PYTHON then shows each call chain, not one line.
    - Short runs need a faster sampler or GROWTH says `too short`: `--every 20` under a few
      seconds, `--every 1` under one second.
@@ -36,7 +43,9 @@ JSON, not the text: it is the stable interface.
    ```
    {"pid", "direct", "indirect", "growth": "PASS|FAIL|too short", "growth_bytes_per_s",
     "growth_window_bytes", "window_from_s",
-    "leaks": [{"bytes", "direct", "indirect", "blocks", "kind": "cpu|gpu|host|mmap", "site"}]}
+    "leaks": [{"bytes", "direct", "indirect", "blocks", "kind": "cpu|gpu|host|mmap", "site"}],
+    "held": [{"site", "held_by"}],            // who holds a PEAK site now: "make_table x.c:7 << global g_cache"
+    "gpu_timeline": [{"site", "points": [[t_ms, bytes]]}]}   // with --gpu-timeline
    ```
 4. **Fix the top direct leak first.** `site` is `function file:line`, the user's own frame
    included. Indirect leaks (only reachable from another leak) usually disappear with their owner;
@@ -56,7 +65,7 @@ Exit codes: `report` returns 0 clean, 1 leak or growth (per `--fail-on any|leaks
 | `kind: gpu` or `host` unfreed | device or pinned buffer never freed | always real: GPU blocks are never treated as reachable |
 | `kind: mmap` | an anonymous mapping never unmapped, or a part of a `PROT_NONE` reservation that `mprotect` committed (site = the `mprotect` call) | real unless it is an arena the runtime keeps by design |
 | a few hundred B in `hsa_amd_signal_create`, `amd::roc::Device`, `_dl_*` | HIP/Mojo runtime residue | suppress, do not "fix" |
-| GROWTH FAIL, few direct leaks | memory held, not lost: caches, queues, pools that keep growing | find the owner via PEAK and HOTSPOTS in the text report |
+| GROWTH FAIL, few direct leaks | memory held, not lost: caches, queues, pools that keep growing | read `held` (`held by:` under PEAK): it names the holder chain, from the site to a global, a thread's stack, or memory from before attach. Holders are recorded for memory live at the report: for a service, `heaptide snapshot` while it grows |
 | GROWTH `too short` | fewer than 5 samples | run longer or lower `--every` |
 
 Suppress with `--supp FILE` (one substring of a site per line). Keep the file next to the test that
@@ -72,6 +81,19 @@ uses it and say in a comment why each line is residue.
 - A run that is mostly loading fails because loading looks like growth. Lengthen the steady
   part; do not raise the limit to make it pass.
 
+## Gate a change in CI
+
+```
+heaptide run --out .work/base -- <cmd>    # on the base build
+heaptide run --out .work/new  -- <cmd>    # on the change
+heaptide diff .work/base .work/new [--fail-on new|grown|none] [--json]
+```
+NEW (a leak site only the change has: exit 1 by default), GROWN (direct or peak up by more than
+64 KiB and 10%: exit 1 with `--fail-on grown`), GONE, SHRUNK. Sites are matched without line
+numbers, so moved code is not a change. Only the sites a report shows are compared (every leak,
+the top N peaks): add `--top 50` for more. It needs llvm-symbolizer: unnamed frames warn and only
+match between identical binaries.
+
 ## Text report for humans
 
 `heaptide report DIR --top 10` prints the same data plus PEAK (who held memory at the peak),
@@ -84,6 +106,12 @@ when the question is "where does memory go", not "what leaked".
 - A forked child keeps the parent's tables until exec; trust exec'd children, not fork-only ones.
 - No `llvm-symbolizer` on the machine: sites show `[module+0xoffset]` only and the report says so. Install
   LLVM or set `HEAPTIDE_SYMBOLIZER`.
+- ASan builds work only with a shared ASan runtime (gcc's default, clang `-shared-libsan`); clang's
+  default static ASan gets a warning and an empty report.
+- Mojo programs: heaptide switches Mojo's allocator to libc at start so its heap is visible; that
+  is skipped when attached.
+- A snapshot never interrupts a thread asleep in a syscall; such a thread's saved registers are
+  not scanned, so in a snapshot (never at exit) a block held only there can show as leaked.
 - Overhead is about 25x on allocation-bound loops; time-sensitive bugs may hide under it.
 - Linux x86-64 only.
 

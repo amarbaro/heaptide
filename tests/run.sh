@@ -25,7 +25,7 @@ waitfor() { local i; for ((i = 0; i < $1 * 20; i++)); do "${@:2}" && return 0; s
 caught() { local p m; p=$(pgrep -nf -- "$1") || return 1; m=$(awk '/^SigCgt/ {print $2}' "/proc/$p/status" 2>/dev/null) || return 1
            (( (16#${m:-0} >> ($2 - 1)) & 1 )); }
 
-for t in c_leak c_reach c_churn c_grow c_flat c_setup c_mmap c_slow c_fork c_interior c_realloc c_peak c_reserve c_signal c_snapshot c_remap c_crash c_steady c_forkmt c_rtsig; do cc -O0 -g -o "build/$t" "tests/$t.c"; done
+for t in c_leak c_reach c_churn c_grow c_flat c_setup c_mmap c_slow c_fork c_interior c_realloc c_peak c_reserve c_signal c_snapshot c_remap c_crash c_steady c_forkmt c_rtsig c_cache c_sleep c_diff c_attach; do cc -O0 -g -o "build/$t" "tests/$t.c"; done
 
 run c_leak -- build/c_leak
 expect c_leak direct "$(sum c_leak direct)" 100005
@@ -76,6 +76,21 @@ has c_mmap "20.0 KiB (direct 20480, indirect 0, 2 blocks) mmap  lose c_mmap.c:12
 run c_fork -- build/c_fork
 expect c_fork child_direct "$(grep -m1 -oE " direct=[0-9]+" "$w/c_fork.err" | cut -d= -f2)" 32
 expect c_fork parent_direct "$(grep -oE " direct=[0-9]+" "$w/c_fork.err" | sed -n 2p | cut -d= -f2)" 64
+# reachable growth: PEAK names who holds it (no leak); a table from another function changes the chain
+run c_cache -- build/c_cache
+expect c_cache direct "$(sum c_cache direct)" 0
+has c_cache "held by: make_table c_cache.c:7"
+has c_cache "<< global g_cache (c_cache)"
+run c_cache_alt -- build/c_cache alt
+has c_cache_alt "held by: alt_table c_cache.c:8"
+# Mojo's own heap: its allocator is routed from the bundled tcmalloc to libc, so a lost block is seen
+mj=${MOJO:-$(command -v mojo || ls "$here/.venv/bin/mojo" 2>/dev/null || true)}
+"$mj" build -g tests/mojo_heap.mojo -o build/mojo_heap > "$w/mojo_heap.build" 2>&1 || true
+run mojo_heap -- build/mojo_heap
+expect mojo_heap direct "$(sum mojo_heap direct)" 8000
+has mojo_heap "mojo_heap::lose"
+expect mojo_heap tcmalloc_arena "$(sum mojo_heap live_mmap)" 0
+expect c_cache json_held "$(./build/heaptide_report "$w/c_cache" --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["held"][0]["held_by"])' 2>&1)" "make_table c_cache.c:7:74 << global g_cache (c_cache)"
 # an ASan-built program (shared runtime, gcc's default): heaptide sees every block, ASan still runs;
 # static ASan (clang's default) cannot be watched and gets a warning instead of a silent empty report
 gcc -O0 -g -fsanitize=address -o build/c_leak_asan tests/c_leak.c
@@ -161,6 +176,26 @@ expect edge_aslim direct "$(sum edge_aslim direct)" 64
 cc -shared -fPIC -DMOCK_LIB -o build/libamdhip64.so tests/hip_mock.c && cc -o build/hip_mock tests/hip_mock.c -Lbuild -lamdhip64 -Wl,-rpath,"$here/build"
 ./heaptide run --out "$w/hip_mockfree" -- build/hip_mock > /dev/null 2> "$w/hip_mockfree.err" || true
 expect hip_mockfree live_gpu "$(sum hip_mockfree live_gpu)" 4096
+# --gpu-timeline on a mock HIP: a site growing in 3 steps, two streams, the runtime's planted 1 MiB
+# per allocation (kept after a free); each part alone, all, and off
+mkdir -p build/tl && cc -shared -fPIC -DMOCK_LIB -o build/tl/libamdhip64.so tests/hip_tl.c && cc -O0 -g -o build/hip_tl tests/hip_tl.c -Lbuild/tl -lamdhip64 -Wl,-rpath,"$here/build/tl"
+run hip_tl --gpu-timeline all --every 50 -- build/hip_tl
+has hip_tl "GPU TIMELINE"
+has hip_tl "[stream 0x1000]"
+has hip_tl "[stream 0x2000]"
+has hip_tl "(device: held beyond live blocks)"
+tlj=$({ ./build/heaptide_report "$w/hip_tl" --json 2>/dev/null || true; } | python3 -c 'import json,sys
+d={x["site"].split(" ")[0]:[p[1] for p in x["points"]] for x in json.load(sys.stdin)[0]["gpu_timeline"]}
+print(d["grow"], d["(device:"][-1])' 2>&1)
+expect hip_tl grow_steps_frag "$tlj" "[4194304, 8388608, 12582912] 7340032"
+run hip_tl_short --gpu-timeline all --every 100000 -- build/hip_tl  # no sample in the run: the report's own
+has hip_tl_short "GPU TIMELINE"
+run hip_tl_sites --gpu-timeline sites --every 50 -- build/hip_tl
+grep -qE "stream 0x|device: held" "$w/hip_tl_sites.txt" && bad hip_tl_sites "streams or frag without asking ($w/hip_tl_sites.txt)" || ok "hip_tl_sites sites only"
+run hip_tl_off --every 50 -- build/hip_tl
+grep -q "GPU TIMELINE" "$w/hip_tl_off.txt" && bad hip_tl_off "timeline without the flag" || ok "hip_tl_off no timeline by default"
+rc=0; ./heaptide run --gpu-timeline bogus -- true 2>/dev/null || rc=$?
+expect hip_tl bad_part_exit "$rc" 2
 mkdir -p "$w/sp ace"; cp build/c_edge "$w/sp ace/c_edge"
 ./heaptide run --out "$w/edge_space" -- "$w/sp ace/c_edge" count 2>/dev/null || true
 ./build/heaptide_report "$w/edge_space" > "$w/edge_space.txt" 2>&1 || true
@@ -201,6 +236,15 @@ waitfor 20 grep -qs held "$w/c_rtsig.out" || true; ./heaptide snapshot "$w/c_rts
 rc=0; wait $p || rc=$?
 expect c_rtsig own_handler_rc "$rc" 0
 grep -q "snapshot skipped" "$w/c_rtsig.err" && bad c_rtsig "snapshot skipped ($w/c_rtsig.err)" || ok "c_rtsig snapshot not skipped"
+# a snapshot leaves a sleeping thread asleep (no park signal) and still names its stack as the holder
+rm -rf "$w/c_sleep"; ./heaptide run --out "$w/c_sleep" -- build/c_sleep > "$w/c_sleep.out" 2> "$w/c_sleep.err" & p=$!
+waitfor 20 grep -qs held "$w/c_sleep.out" || true; ./heaptide snapshot "$w/c_sleep" >/dev/null 2>&1
+waitfor 20 grep -qs "heaptide: snapshot pid" "$w/c_sleep.err" || true
+rm -rf "$w/c_sleep_s"; cp -r "$w/c_sleep" "$w/c_sleep_s"
+rc=0; wait $p || rc=$?
+expect c_sleep slept_through_rc "$rc" 0
+./build/heaptide_report "$w/c_sleep_s" > "$w/c_sleep.txt" 2>&1 || true
+has c_sleep "held by: a thread's stack"
 expect c_snapshot mid_blocks "${blk:-}" "$(( ${mid:-0} / 1024 ))"  # row counters flushed in the snapshot
 expect c_snapshot final_direct "$(grep -v snapshot "$w/c_snap.err" | grep -m1 -oE " direct=[0-9]+" | cut -d= -f2)" 40960
 # no process can be forked (RLIMIT_NPROC): the snapshot scans in place and undoes its marks
@@ -266,6 +310,50 @@ sb=$(grep -l heaptide_report "$w"/self/heaptide.*.bin | head -1 || true); [[ -n 
 rc=0; ./build/heaptide_report "$w/self1" --supp tests/self.supp --fail-on leaks > "$w/self.txt" 2>&1 || rc=$?
 expect self fail_on_leaks "$rc" 0
 has self "exe $here/build/heaptide_report"
+# heaptide diff: a new leak site fails (exit 1), a grown peak is listed, a moved line is the same site
+cc -O0 -g -DEXTRA -o build/c_diff_b tests/c_diff.c 2>/dev/null
+run c_diff -- build/c_diff
+run c_diff_b -- build/c_diff_b
+rc=0; ./heaptide diff "$w/c_diff" "$w/c_diff_b" > "$w/diff.txt" 2>&1 || rc=$?
+expect diff new_exit "$rc" 1
+has diff "NEW  "
+grep -q "^NEW .*lose_b c_diff.c" "$w/diff.txt" && ok "diff NEW lose_b" || bad diff "no NEW lose_b ($w/diff.txt)"
+grep -q "^GROWN .*1.0 MiB -> 4.0 MiB peak .*buffer c_diff.c" "$w/diff.txt" && ok "diff GROWN buffer" || bad diff "no GROWN buffer ($w/diff.txt)"
+grep -q "lose_a" "$w/diff.txt" && bad diff "lose_a moved a line and was reported ($w/diff.txt)" || ok "diff moved line is the same site"
+rc=0; ./heaptide diff "$w/c_diff" "$w/c_diff" > "$w/diff_self.txt" 2>&1 || rc=$?
+expect diff self_exit "$rc $(wc -c < "$w/diff_self.txt")" "0 0"
+rc=0; ./heaptide diff "$w/c_diff" "$w/c_diff_b" --fail-on none >/dev/null 2>&1 || rc=$?
+expect diff none_exit "$rc" 0
+HEAPTIDE_SYMBOLIZER=/nonexistent ./heaptide diff "$w/c_diff" "$w/c_diff_b" 2> "$w/diff_nosym.err" >/dev/null || true
+grep -q "warning: unnamed frames" "$w/diff_nosym.err" && ok "diff warns without names" || bad diff "no warning without llvm-symbolizer ($w/diff_nosym.err)"
+expect diff json "$(./heaptide diff "$w/c_diff" "$w/c_diff_b" --json 2>/dev/null | python3 -c 'import json,sys;print(sorted(c["group"] for c in json.load(sys.stdin)["changes"]))' 2>&1 || true)" "['GROWN', 'NEW']"
+# heaptide attach: a process started without heaptide; leaks made after attach are reported, blocks
+# reachable only through memory from before attach are not; no ptrace permission: exit 2
+rm -rf "$w/c_attach"; build/c_attach > "$w/c_attach.pid" 2> "$w/c_attach.err" & p=$!
+waitfor 20 test -s "$w/c_attach.pid" || true
+rc=0; ./heaptide attach "$(head -1 "$w/c_attach.pid")" --out "$w/c_attach" 2> "$w/c_attach.attach" || rc=$?
+expect c_attach attach_exit "$rc" 0
+rc=0; wait $p || rc=$?
+expect c_attach program_exit "$rc" 0
+./build/heaptide_report "$w/c_attach" > "$w/c_attach.txt" 2>&1 || true
+has c_attach "cpu  lose_after c_attach.c:12"
+has c_attach "held by: memory from before attach"
+sed -n '/^LEAKS/,/^GROWTH/p' "$w/c_attach.txt" | grep -q "c_attach.c:19" && bad c_attach "table entries reported as leaks ($w/c_attach.txt)" || ok "c_attach no false leak from before attach"
+sleep 30 & sp=$!; rc=0; ./heaptide attach $sp --out "$w/c_attach_denied" 2>/dev/null || rc=$?; kill $sp 2>/dev/null || true
+expect c_attach denied_exit "$rc" 2
+# a full-RELRO target keeps its GOT read-only after attach (heaptide writes its slots, then restores)
+cc -O0 -g -Wl,-z,relro,-z,now -o build/c_attach_now tests/c_attach.c
+build/c_attach_now > "$w/c_attach_now.pid" 2>/dev/null & p=$!
+waitfor 20 test -s "$w/c_attach_now.pid" || true; ap=$(head -1 "$w/c_attach_now.pid")
+./heaptide attach "$ap" --out "$w/c_attach_now" 2>/dev/null || true
+off=$(readelf -rW build/c_attach_now | awk '/ malloc@/ {print $1; exit}')
+gp=""; base=""  # bash arithmetic, not gawk's strtonum (Ubuntu's awk is mawk)
+while read -r r perm _ _ _ path; do
+  [[ $path == */c_attach_now ]] || continue; lo=$((16#${r%-*})); hi=$((16#${r#*-})); base=${base:-$lo}
+  (( base + 16#$off >= lo && base + 16#$off < hi )) && gp=$perm
+done < /proc/$ap/maps || true
+wait $p || true
+expect c_attach got_page_after_attach "$gp" "r--p"
 # symbolizer lookup: none found -> modules only, never a crash; one on PATH wins over ROCm's
 HEAPTIDE_SYMBOLIZER=/nonexistent ./build/heaptide_report "$w/demo" --top 1 > "$w/nosym.txt" 2>&1 || true
 has nosym "sites show modules only"
@@ -299,6 +387,13 @@ if python3 -c "import numpy" 2>/dev/null; then
   run py_mod --py -- python3 -m tests.py_leak  # python -m: the same planted lines through runpy.run_module
   has py_mod "py_leak.py:6"
   has py_mod "py_leak.py:7"
+  # one stack: a native (ctypes malloc) and a GPU (ctypes hipMalloc, library loaded RTLD_LOCAL) site
+  # name the Python function that made them (CPython's perf trampoline, -X perf, Python >= 3.12)
+  run py_mixed --py -- python3 tests/py_mixed.py
+  grep -qE "cpu  .*<- py::leak_in_native py_mixed.py" "$w/py_mixed.txt" && ok "py_mixed native site names py::leak_in_native" || bad py_mixed "no py frame on a cpu site ($w/py_mixed.txt)"
+  run py_gpu --py -- python3 tests/py_gpu.py "$here/build/tl/libamdhip64.so"
+  expect py_gpu live_gpu "$(sum py_gpu live_gpu)" 1048576
+  grep -qE "gpu  .*<- py::load_weights py_gpu.py" "$w/py_gpu.txt" && ok "py_gpu GPU site names py::load_weights" || bad py_gpu "no py frame on a gpu site ($w/py_gpu.txt)"
   run py_deep --py --py-depth 2 -- python3 tests/py_deep.py
   has py_deep "py_deep.py:4 <- "
   has py_deep "py_deep.py:6"
@@ -339,10 +434,11 @@ else
   queue=(); command -v gpu-wait >/dev/null && queue=(gpu-wait run --priority 90 --vram 1 --timeout 120 --label heaptide-tests --)
   GPU_BARE_ALLOW=1 timeout 120 /opt/rocm/bin/hipcc -g --offload-arch="$arch" -o build/hip_leak tests/hip_leak.hip 2>/dev/null
   GPU_BARE_ALLOW=1 timeout 300 "$mojo" build -g --target-accelerator "$arch" tests/mojo_leak.mojo -o build/mojo_leak 2>/dev/null || true
-  "${queue[@]}" bash -c "cd '$here' && ./heaptide run --out $w/hip_leak -- build/hip_leak 2> $w/hip_leak.err; ./heaptide run --gpu --out $w/mojo_leak -- build/mojo_leak 2> $w/mojo_leak.err" >/dev/null 2>&1 || true
-  for t in hip_leak mojo_leak; do ./build/heaptide_report "$w/$t" --top 5 > "$w/$t.txt" 2>&1 || true; done
+  "${queue[@]}" bash -c "cd '$here' && ./heaptide run --out $w/hip_leak -- build/hip_leak 2> $w/hip_leak.err; ./heaptide run --gpu --out $w/mojo_leak -- build/mojo_leak 2> $w/mojo_leak.err; ./heaptide run --gpu-timeline all --out $w/hip_leak_tl -- build/hip_leak 2> $w/hip_leak_tl.err" >/dev/null 2>&1 || true
+  for t in hip_leak mojo_leak hip_leak_tl; do ./build/heaptide_report "$w/$t" --top 5 > "$w/$t.txt" 2>&1 || true; done
   expect hip_leak live_gpu "$(sum hip_leak live_gpu)" 5242880
   has hip_leak "hip_leak.hip:4"
+  has hip_leak_tl "GPU TIMELINE"
   expect mojo_leak live_gpu "$(grep -oE "live_gpu=[1-9][0-9]*" "$w/mojo_leak.err" | cut -d= -f2 || true)" 4194304
   has mojo_leak "mojo_leak.mojo:8"
 fi

@@ -68,6 +68,13 @@ static struct { _Alignas(64) _Atomic int64_t k[8]; pend_t pend[16]; } lslot[SLOT
 static _Atomic int nslot;
 static TLS int my_slot = -1;
 static TLS unsigned tick;
+// --gpu-timeline (1 sites, 2 streams, 4 frag): GPU/HOST rows skip the batch so the sampler reads
+// them current; each change is one {sample << 32 | id, live bytes} entry in tl
+static int tl_parts;
+static TLS uintptr_t stream_tag;  // hipMallocAsync's stream, interned as one more frame
+static uint32_t gids[4096];
+static _Atomic uint32_t ngids;
+static uint64_t (*tl)[2], ntl, frag_base = ~0ULL;
 static void *vm(size_t n);
 // A thread's first allocation takes a slot and a signal stack: its stack overflow gets a report.
 static void new_thread(void) {
@@ -88,7 +95,7 @@ static void flush(pend_t *e) {
 }
 static void bump(uint32_t id, int64_t a, int64_t b, int64_t t, int64_t ln, int64_t lb) {
   if (my_slot < 0) new_thread();
-  if (my_slot >= SLOTS) {  // slot shared with another thread: no batching
+  if (my_slot >= SLOTS || (tl_parts && (rows[id].kind == GPU || rows[id].kind == HOST))) {  // shared slot, or a timeline row
     row_t *r = &rows[id];
     r->allocs += a; r->bytes += b; r->temps += t; r->live_n += ln; r->live_b += lb;
     return;
@@ -196,6 +203,7 @@ static uint32_t intern(void **ips, int d, int kind) {
       if (id) {
         memcpy(ips_arena + off, ips, d * sizeof(void *));
         rows[id].ips_off = off; rows[id].depth = d; rows[id].kind = kind;
+        if (tl_parts && (kind == GPU || kind == HOST) && ngids < 4096) gids[atomic_fetch_add(&ngids, 1) % 4096] = id;
         put(s, h, c << 32 | id);
       }
     }
@@ -232,6 +240,7 @@ __attribute__((always_inline)) static inline uint32_t stack_id(int kind) {  // i
     for (int j = 0; j < i; j++)
       if (ips[j] == ips[i]) { d = i; goto cut; }
 cut:;
+  if (stream_tag && d < depth && ips + d < buf + DEPTH + 4) ips[d++] = (void *)(1ULL << 63 | stream_tag);
   return intern(ips, d, kind);
 }
 
@@ -457,14 +466,27 @@ HOOK void *mremap(void *p, size_t o, size_t n, int fl, ...) {
 }
 
 // HIP: the Mojo runtime resolves these through dlsym after dlopen, so dlsym is hooked too.
+static void *hip_handle;  // a HIP library dlopen'ed RTLD_LOCAL (ctypes): neither global nor named .so.7
 static void *hip(const char *name) {
   void *f = next(name), *h;
+  if (!f && hip_handle) f = r_dlsym(hip_handle, name);
   if (!f && (h = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_NOLOAD))) f = r_dlsym(h, name);
   return f;
 }
 #define REAL(args, name) static int(*r) args; if (!r) r = hip(name)
-HOOK int hipMalloc(void **p, size_t n) { REAL((void **, size_t), "hipMalloc"); int e = IN(r(p, n)); if (!e) track(*p, n, GPU); return e; }
-HOOK int hipMallocAsync(void **p, size_t n, void *s) { REAL((void **, size_t, void *), "hipMallocAsync"); int e = IN(r(p, n, s)); if (!e) track(*p, n, GPU); return e; }
+static uint64_t dev_used(void) {  // device bytes in use (all its users), ~0 when HIP cannot say
+  size_t fr, to;
+  REAL((size_t *, size_t *), "hipMemGetInfo");
+  return r && !r(&fr, &to) ? to - fr : ~0ULL;
+}
+// before the program's first GPU allocation: what the device's other users hold
+#define FRAG_BASE() if ((tl_parts & 4) && frag_base == ~0ULL) frag_base = dev_used()
+HOOK int hipMalloc(void **p, size_t n) { REAL((void **, size_t), "hipMalloc"); FRAG_BASE(); int e = IN(r(p, n)); if (!e) track(*p, n, GPU); return e; }
+HOOK int hipMallocAsync(void **p, size_t n, void *s) {
+  REAL((void **, size_t, void *), "hipMallocAsync"); FRAG_BASE(); int e = IN(r(p, n, s));
+  if (!e) stream_tag = tl_parts & 2 ? (uintptr_t)s | 1 : 0, track(*p, n, GPU), stream_tag = 0;  // | 1: the null stream too
+  return e;
+}
 HOOK int hipHostMalloc(void **p, size_t n, unsigned f) { REAL((void **, size_t, unsigned), "hipHostMalloc"); int e = IN(r(p, n, f)); if (!e) track(*p, n, HOST); return e; }
 // untracked first (another thread may get the address once it is freed), restored if the free fails
 HOOK int hipFree(void *p) { REAL((void *), "hipFree"); uint64_t v = untrack(p); int e = IN(r(p)); if (e) retrack(p, v, 0); return e; }
@@ -481,7 +503,11 @@ HOOK void *dlsym(void *h, const char *name) {
   if (!r_dlsym) r_dlsym = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
   if (!r_dlsym) return 0;  // asked before libdl answers (ASan's init, run by the loader): not found
   for (size_t i = 0; i < sizeof ours / sizeof *ours; i++)  // ours only where the real one exists
-    if (same(name, ours[i].n)) return (h == RTLD_DEFAULT || h == RTLD_NEXT ? next(name) : r_dlsym(h, name)) ? ours[i].f : 0;
+    if (same(name, ours[i].n)) {
+      void *real = h == RTLD_DEFAULT || h == RTLD_NEXT ? next(name) : r_dlsym(h, name);
+      if (real && h != RTLD_DEFAULT && h != RTLD_NEXT) hip_handle = h;
+      return real ? ours[i].f : 0;
+    }
   // a tail call keeps the caller's return address, which glibc reads to resolve RTLD_NEXT
   MUSTTAIL return r_dlsym(h, name);
 }
@@ -513,6 +539,31 @@ static void on_crash(int sig, siginfo_t *si, void *ctx) {
 static pid_t child;  // the fork that writes a snapshot
 // Samples live bytes; on SIGTERM/SIGINT/SIGHUP writes the final report and dies of the signal;
 // writes a snapshot every --snapshot-every, or when OUT/snapshot appears (heaptide snapshot).
+static void tl_add(uint64_t i, uint32_t id, uint64_t v, uint64_t *last) {
+  if (v != *last && ntl < MAXSAMPLES) tl[ntl][0] = i << 32 | id, tl[ntl++][1] = v, *last = v;
+}
+// One timeline sample: every watched site whose live bytes moved, and for frag (once the program
+// itself has made a GPU allocation: never initialise HIP for it) what the device holds beyond them.
+static void timeline(uint64_t i) {
+  static uint64_t last[4096 + 2];
+  uint32_t n = ngids < 4096 ? ngids : 4096;
+  for (uint32_t g = 0; g < n; g++) tl_add(i, gids[g], rows[gids[g]].live_b, &last[g]);
+  uint64_t gpu = live_total(GPU);
+  if (!(tl_parts & 4) || !n) return;
+  uint64_t used_now = dev_used();
+  if (used_now != ~0ULL) tl_add(i, ~0u, used_now > frag_base + gpu ? used_now - frag_base - gpu : 0, &last[4096]);
+  void *pool; uint64_t res = 0, used = 0;
+  { REAL((void **, int), "hipDeviceGetDefaultMemPool"); if (!r || r(&pool, 0)) return; }
+  { REAL((void *, int, void *), "hipMemPoolGetAttribute"); if (!r || r(pool, 5, &res) || r(pool, 7, &used)) return; }  // reserved, used
+  tl_add(i, ~0u - 1, res > used ? res - used : 0, &last[4097]);
+}
+static void sample(void) {
+  uint64_t i = nsamples;  // written, then counted: a reader never sees half a sample
+  if (i >= MAXSAMPLES) return;
+  samples[i][0] = now_ns(); samples[i][1] = live_total(CPU) + live_total(HOST) + live_total(MMAP); samples[i][2] = live_total(GPU);
+  nsamples = i + 1;
+  if (tl) timeline(i);
+}
 static void *sampler(void *a) {
   (void)a;
   guard = 1;
@@ -520,11 +571,7 @@ static void *sampler(void *a) {
   char trig[4200];
   snprintf(trig, sizeof trig, "%s/snapshot", outdir);
   for (uint64_t next = now_ns() + snap_ns; !stop;) {
-    uint64_t i = nsamples;
-    if (i < MAXSAMPLES) {
-      samples[i][0] = now_ns(); samples[i][1] = live_total(CPU) + live_total(HOST) + live_total(MMAP); samples[i][2] = live_total(GPU);
-      nsamples = i + 1;
-    }
+    sample();
     if (got_sig) { int sig = got_sig; report(1); signal(sig, SIG_DFL); raise(sig); }
     if (child > 0 && syscall(SYS_wait4, child, 0, WNOHANG | __WCLONE, 0) == child) child = 0;
     if (child <= 0 && ((snap_ns && now_ns() >= next) || !unlink(trig))) report(0), next = now_ns() + snap_ns;
@@ -539,6 +586,9 @@ static void *sampler(void *a) {
 static int heap(uint64_t v) { int k = rows[v & (REACH - 1)].kind; return k == CPU || k == MMAP; }
 static ent_t **work;
 static size_t nwork;
+// retention: per site, the first holder that reached one of its blocks: a site id, or a root
+// (1<<63 | address of the global word; 1<<62 a thread's stack or registers)
+static uint64_t *held, cur;
 // A word pointing into a block keeps it alive too (LSan): a binary search of the CPU/mmap blocks
 // sorted by start, only for words inside [heap_lo, heap_hi). Every 16th start is copied to `top`
 // and every 16th of those to `top2` (L2-sized up to ~40M blocks): a word is searched in top2, then
@@ -553,6 +603,7 @@ static void scan(const char *b, const char *e, uint64_t bit) {
   b = (const char *)(((uintptr_t)b + 7) & ~7UL);
   while (b + 8 <= e) {
     uint64_t w[BATCH];
+    const char *wa[BATCH];
     const ent_t *r[BATCH];
     const uint64_t *tr[BATCH];
     int k = 0;
@@ -563,7 +614,7 @@ static void scan(const char *b, const char *e, uint64_t bit) {
       for (size_t n = (ntop + RUN - 1) / RUN; n > 1; n -= n / 2) t = t[n / 2] <= v ? t + n / 2 : t;
       t = top + (t - top2) * RUN;
       __builtin_prefetch(t); __builtin_prefetch(t + 8);
-      tr[k] = t; w[k++] = v;
+      tr[k] = t; wa[k] = b; w[k++] = v;
     }
     for (int j = 0; j < k; j++) {
       const uint64_t *t = tr[j];
@@ -580,7 +631,10 @@ static void scan(const char *b, const char *e, uint64_t bit) {
     for (int j = 0; j < k; j++) {
       ent_t *x = (ent_t *)r[j]->v;
       // GPU/host blocks are never roots-reachable: the HIP runtime's own tables point at all of them
-      if (w[j] < x->k + (x->v >> SIZE_SHIFT) && !(x->v & (REACH | INDIRECT)) && heap(x->v)) { x->v |= bit; work[nwork++] = x; }
+      if (w[j] < x->k + (x->v >> SIZE_SHIFT) && !(x->v & (REACH | INDIRECT)) && heap(x->v)) {
+        x->v |= bit; work[nwork++] = x;
+        if (bit == REACH && !held[x->v & (REACH - 1)]) held[x->v & (REACH - 1)] = cur ? cur : 1ULL << 63 | (uint64_t)wa[j];
+      }
     }
   }
 }
@@ -612,7 +666,9 @@ static void contents(uint64_t p, uint64_t v, uint64_t bit) {
   if (k == MMAP) scan_copy(p, p + (v >> SIZE_SHIFT), bit, 0);
 }
 static void flood(uint64_t bit) {
-  while (nwork) { ent_t *x = work[--nwork]; contents(x->k, x->v, bit); }
+  uint64_t root = cur;  // the root being scanned (0 a global, 1<<62 a thread): restored for the next word
+  while (nwork) { ent_t *x = work[--nwork]; cur = x->v & (REACH - 1); contents(x->k, x->v, bit); }
+  cur = root;
 }
 static uintptr_t ld_lo, ld_n;  // the dynamic linker's code
 static uint64_t (*segs)[2];  // writable segments, listed before threads park: a parked thread may
@@ -630,6 +686,90 @@ static int root_cb(struct dl_phdr_info *in, size_t sz, void *self) {
     }
   }
   return 0;
+}
+
+// heaptide attach (gdb dlopens this library into a running program): the program's GOT slots were
+// bound before we existed, so each one naming a hooked function is pointed at ours. Our own
+// definitions come from our handle (a plain &malloc here would bind to libc's, first in scope).
+static const char *hooked[] = {"malloc", "calloc", "free", "realloc", "reallocarray", "posix_memalign", "aligned_alloc",
+  "memalign", "valloc", "mmap", "mmap64", "munmap", "mprotect", "madvise", "mremap", "hipMalloc", "hipMallocAsync",
+  "hipHostMalloc", "hipFree", "hipHostFree", "hipFreeAsync"};
+static void *own[sizeof hooked / sizeof *hooked];
+static uint64_t (*pre)[2];  // writable anonymous memory at attach: may hold the only pointer to a new block
+static int npre;
+static int patch_cb(struct dl_phdr_info *in, size_t sz, void *self) {
+  (void)sz;
+  const ElfW(Dyn) *d = 0;
+  uintptr_t ro = 0, ro_n = 0;  // RELRO: read-only again once its slots are written
+  for (int i = 0; i < in->dlpi_phnum; i++) {
+    if (in->dlpi_phdr[i].p_type == PT_DYNAMIC) d = (void *)(in->dlpi_addr + in->dlpi_phdr[i].p_vaddr);
+    if (in->dlpi_phdr[i].p_type == PT_GNU_RELRO) ro = in->dlpi_addr + in->dlpi_phdr[i].p_vaddr, ro_n = in->dlpi_phdr[i].p_memsz;
+  }
+  if (!d || in->dlpi_addr == (uintptr_t)self) return 0;
+  const ElfW(Sym) *sym = 0; const char *str = 0; const ElfW(Rela) *rel[2] = {0}; size_t n[2] = {0};
+  for (; d->d_tag != DT_NULL; d++) {
+    uintptr_t v = d->d_un.d_ptr < in->dlpi_addr ? in->dlpi_addr + d->d_un.d_ptr : d->d_un.d_ptr;
+    if (d->d_tag == DT_SYMTAB) sym = (void *)v;
+    if (d->d_tag == DT_STRTAB) str = (void *)v;
+    if (d->d_tag == DT_JMPREL) rel[0] = (void *)v;
+    if (d->d_tag == DT_RELA) rel[1] = (void *)v;
+    if (d->d_tag == DT_PLTRELSZ) n[0] = d->d_un.d_val / sizeof(ElfW(Rela));
+    if (d->d_tag == DT_RELASZ) n[1] = d->d_un.d_val / sizeof(ElfW(Rela));
+  }
+  for (int k = 0; sym && str && k < 2; k++)
+    for (size_t j = 0; rel[k] && j < n[k]; j++) {
+      uint32_t t = ELF64_R_TYPE(rel[k][j].r_info);
+      if (t != R_X86_64_JUMP_SLOT && t != R_X86_64_GLOB_DAT) continue;
+      const char *name = str + sym[ELF64_R_SYM(rel[k][j].r_info)].st_name;
+      for (size_t h = 0; h < sizeof hooked / sizeof *hooked; h++)
+        if (own[h] && !strcmp(name, hooked[h])) {
+          void **slot = (void **)(in->dlpi_addr + rel[k][j].r_offset);
+          mprotect((void *)((uintptr_t)slot & ~4095UL), 4096, PROT_READ | PROT_WRITE);
+          *slot = own[h];
+        }
+    }
+  if (ro_n) mprotect((void *)(ro & ~4095UL), (ro + ro_n + 4095) / 4096 * 4096 - (ro & ~4095UL), PROT_READ);
+  return 0;
+}
+static ssize_t slurp(const char *path, char *buf, size_t n);
+static void unvm(void *p, size_t n);
+static void attach(void) {
+  Dl_info me; dladdr((void *)attach, &me);
+  void *h = dlopen(me.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+  for (size_t i = 0; h && i < sizeof hooked / sizeof *hooked; i++) own[i] = r_dlsym(h, hooked[i]);
+  char *maps = vm(1 << 20);  // only when attached: a static buffer cost every program 2 MB resident
+  if (!maps) return;
+  slurp("/proc/self/maps", maps, 1 << 20);
+  pre = vm(4096 * 16);
+  for (char *l = maps; pre && *l && npre < 4096; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : "") {
+    char *q, *nl = strchr(l, '\n');
+    uint64_t a = strtoull(l, &q, 16), e = strtoull(q + 1, &q, 16);
+    if (q[1] == 'r' && q[2] == 'w' && (!strchr(q, '/') || strchr(q, '/') > nl) && (!strchr(q, '[') || !strncmp(strchr(q, '['), "[heap]", 6)))
+      pre[npre][0] = a, pre[npre++][1] = e;
+  }
+  unvm(maps, 1 << 20);
+  dl_iterate_phdr(patch_cb, me.dli_fbase);
+}
+// Memory from before attach is a root, but not the blocks tracked inside it: those are scanned only
+// when reached, so a lost block still shows (a stale pointer in a freed chunk can hide one: an
+// attached report can under-report, never over-report).
+static void scan_pre(void) {
+  cur = 1ULL << 61;
+  for (int r = 0; r < npre; r++) {
+    uint64_t at = pre[r][0], e = pre[r][1];
+    size_t lo = 0, hi = nstarts;  // first block starting at or after the range, minus one (it may overlap)
+    while (lo < hi) { size_t m = (lo + hi) / 2; if (starts[m].k < at) lo = m + 1; else hi = m; }
+    for (size_t i = lo ? lo - 1 : 0; i < nstarts && at < e; i++) {
+      ent_t *x = (ent_t *)starts[i].v;
+      uint64_t end = x->k + (x->v >> SIZE_SHIFT);
+      if (end <= at) continue;
+      if (x->k >= e) break;
+      if (x->k > at) scan_copy(at, x->k, REACH, 0), flood(REACH);
+      at = end;
+    }
+    if (at < e) scan_copy(at, e, REACH, 0), flood(REACH);
+  }
+  cur = 0;
 }
 
 // Thread roots (LSan: every thread's registers and its stack from SP up). Each other thread is
@@ -675,8 +815,11 @@ static int park_sig(void) {
   if (sig) sigaction(sig, &sa, 0);
   return sig;
 }
-static int stop_threads(void) {  // 1 when every other thread is parked
-  int sig = park_sig(), sent = 0;
+// 1 when every other thread is parked or, for a snapshot, asleep in a system call: a signal would
+// end that sleep early (nanosleep, poll, epoll_wait return EINTR), so such a thread is read from
+// /proc instead (stack pointer only: its saved registers are not scanned)
+static int stop_threads(int snap) {
+  int sig = park_sig(), sent = 0, asleep = 0;
   nthr = 0; parked = 0; released = 0;  // no free signal: threads listed, none parked (as if blocked)
   if (!thr) thr = vm(MAXTHR * sizeof(thr_t));  // kept: a late park signal still reads it
   DIR *d = opendir("/proc/self/task");
@@ -685,6 +828,8 @@ static int stop_threads(void) {  // 1 when every other thread is parked
   if (d) closedir(d);
   char path[64], buf[4096];
   for (int i = 0; i < nthr; i++) {
+    snprintf(path, sizeof path, "/proc/self/task/%d/syscall", thr[i].tid);
+    if (snap && slurp(path, buf, sizeof buf) > 0 && buf[0] != 'r') { asleep++; continue; }  // not "running"
     snprintf(path, sizeof path, "/proc/self/task/%d/status", thr[i].tid);
     char *b = slurp(path, buf, sizeof buf) > 0 ? strstr(buf, "SigBlk:") : 0;
     if (sig && b && !(strtoull(b + 7, 0, 16) >> (sig - 1) & 1) && !syscall(SYS_tgkill, getpid(), thr[i].tid, sig)) sent++;
@@ -698,7 +843,7 @@ static int stop_threads(void) {  // 1 when every other thread is parked
       for (int k = 0; f && k < 7; k++) f = strchr(f + 1, ' ');
       thr[i].sp = f ? strtoull(f + 1, 0, 16) : 0;
     }
-  return parked == nthr;
+  return parked + asleep == nthr;
 }
 static uint64_t stack_top(uint64_t sp, const char *maps) {  // end of the readable mapping holding sp
   for (const char *l = maps; *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : "") {
@@ -743,6 +888,7 @@ static atomic_flag reporting;
 static void report(int final) {
   struct timespec ms = {0, 1000000};
   while (atomic_flag_test_and_set(&reporting)) nanosleep(&ms, 0);
+  if (tl) sample();  // the state at this report: a program shorter than one --every still has a point
   if (done) { atomic_flag_clear(&reporting); return; }
   if (final) done = 1, ready = 0, stop = 1;
   if (final && child > 0) syscall(SYS_wait4, child, 0, __WCLONE, 0), child = 0;  // a late snapshot must not overwrite this
@@ -751,7 +897,7 @@ static void report(int final) {
   segs = vm(4096 * 16);
   Dl_info me; dladdr((void *)report, &me);
   dl_iterate_phdr(root_cb, me.dli_fbase);
-  int all_parked = stop_threads();
+  int all_parked = stop_threads(!final);
   if (!final && !all_parked) {
     released = 1; unvm(segs, 4096 * 16);
     dprintf(2, "heaptide: snapshot skipped: %d of %d threads parked\n", (int)parked, nthr);
@@ -792,8 +938,9 @@ static void report(int final) {
     }
     unvm(vec, np + 1);
   }
-  work = vm((na + 1) * 8); starts = vm((na + 1) * 16);
-  if (!work || !starts) goto nomem;
+  uint32_t n = nstacks < maxstacks ? nstacks : maxstacks - 1;
+  work = vm((na + 1) * 8); starts = vm((na + 1) * 16); held = vm((n + 1) * 8);
+  if (!work || !starts || !held) goto nomem;
   for (size_t i = 0; i < na; i++) {
     ent_t *x = all[i];
     was[i] = !!(x->v & REACH);
@@ -809,6 +956,7 @@ static void report(int final) {
   for (size_t i = 0; i < nstarts; i += RUN) top[i / RUN] = starts[i].k;
   for (size_t i = 0; i < ntop; i += RUN) top2[i / RUN] = top[i];
   for (int i = 0; i < nsegs; i++) scan((char *)segs[i][0], (char *)segs[i][1], REACH), flood(REACH);
+  if (npre) scan_pre();
   // LSan's use_ld_allocations: a block with a linker frame is a root (a thread's DTV is held as
   // dtv + 1 in its TCB); blocks inherited over fork are roots too (see forked)
   for (size_t i = 0; i < na; i++) {
@@ -819,10 +967,9 @@ static void report(int final) {
     if (x->v & REACH) work[nwork++] = x;
   }
   flood(REACH);
-  int scanned = scan_threads();
+  cur = 1ULL << 62; int scanned = scan_threads(); cur = 0;
   for (size_t i = 0; i < na; i++)
     if (!(all[i]->v & (REACH | INDIRECT)) && heap(all[i]->v)) contents(all[i]->k, all[i]->v, INDIRECT), flood(INDIRECT);
-  uint32_t n = nstacks < maxstacks ? nstacks : maxstacks - 1;
   uint64_t *direct = vm((n + 1) * 24), *indirect = direct + n + 1, *blocks = indirect + n + 1, sum[3] = {0};
   if (!direct) goto nomem;
   for (size_t i = 0; i < na; i++) {
@@ -843,7 +990,7 @@ static void report(int final) {
   snprintf(tmp, sizeof tmp, "%s.tmp", path);
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
-    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms, 3 /* leaked block counts, then maps text */, 0};
+    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms, 7 | (tl ? 8 : 0) /* leaked block counts, retention, timeline, then maps text */, 0};
     wr(fd, hdr, sizeof hdr);
     wr(fd, ips_arena, ips_used * 8);
     wr(fd, rows + 1, n * sizeof(row_t));
@@ -851,6 +998,8 @@ static void report(int final) {
     wr(fd, indirect + 1, n * 8);
     wr(fd, samples, nsamples * 24);
     wr(fd, blocks + 1, n * 8);
+    wr(fd, held + 1, n * 8);
+    if (tl) { uint64_t c = ntl; wr(fd, &c, 8); wr(fd, tl, c * 16); }
     int in = open("/proc/self/maps", O_RDONLY);
     char buf[1 << 16];
     for (ssize_t k; in >= 0 && ((k = read(in, buf, sizeof buf)) > 0 || (k < 0 && errno == EINTR));)
@@ -867,7 +1016,7 @@ static void report(int final) {
   finished = final;
   unvm(segs, 4096 * 16); unvm(all, (total + 1) * 8); unvm(mmv, (nmm + nd + 1) * 16);
   unvm(was, total + 1); unvm(work, (na + 1) * 8); unvm(starts, (na + 1) * 16); unvm(top, (ntop + 1) * 8); unvm(top2, (ntop / RUN + 1) * 8);
-  unvm(direct, (n + 1) * 24);
+  unvm(direct, (n + 1) * 24); unvm(held, (n + 1) * 8);
   guard = g;
   atomic_flag_clear(&reporting);
   return;
@@ -924,6 +1073,12 @@ static void forked(void) {
 
 __attribute__((constructor)) static void init(void) {
   resolve();
+  // Mojo allocates through its bundled tcmalloc, which malloc hooks never see. Its runtime's sanitizer
+  // switch routes every Mojo allocation to libc malloc/aligned_alloc/free instead (and no tcmalloc
+  // arena is mapped): set before Mojo allocates, so no tcmalloc block is ever handed to free
+  void (*mojo_libc)(void) = (void (*)(void))r_dlsym(RTLD_DEFAULT, "KGEN_CompilerRT_SetAsanAllocators");
+  if (getenv("HEAPTIDE_ATTACH")) attach();  // never the Mojo switch then: a tcmalloc block would reach libc free
+  else if (mojo_libc) mojo_libc();
   // ~9 GiB of address space, touched only as used; under ulimit -v the row and frame arenas
   // shrink to a quarter of the limit (fewer distinct stacks), and if even that fails heaptide is off
   struct rlimit as;
@@ -944,6 +1099,7 @@ __attribute__((constructor)) static void init(void) {
   dl_iterate_phdr(self_cb, me.dli_fbase);
   unw_set_caching_policy(unw_local_addr_space, UNW_CACHE_PER_THREAD);
   if ((e = getenv("HEAPTIDE_OUT"))) snprintf(outdir, sizeof outdir, "%s", e);
+  if ((e = getenv("HEAPTIDE_GPU_TIMELINE")) && (tl_parts = atoi(e) & 7)) tl = vm((size_t)MAXSAMPLES * 16);
   if ((e = getenv("HEAPTIDE_SNAPSHOT_EVERY")) && atof(e) > 0) snap_ns = (uint64_t)(atof(e) * 1e9);
   // report on the usual stop signals, only where the program kept the default (it may set its own later)
   struct sigaction sa = {.sa_handler = on_term, .sa_flags = SA_RESTART}, old;

@@ -80,8 +80,9 @@ expect c_fork parent_direct "$(grep -oE " direct=[0-9]+" "$w/c_fork.err" | sed -
 # static ASan (clang's default) cannot be watched and gets a warning instead of a silent empty report
 gcc -O0 -g -fsanitize=address -o build/c_leak_asan tests/c_leak.c
 run c_leak_asan -- build/c_leak_asan
-expect c_leak_asan direct "$(sum c_leak_asan direct)" 100005
-has c_leak_asan "lose c_leak.c:3"
+# the planted rows, not the total: ASan's runtime sometimes leaves a block of its own (CI: +32 B)
+has c_leak_asan "(direct 100000, indirect 0, 100 blocks) cpu  lose c_leak.c:3"
+has c_leak_asan "(direct 5, indirect 0, 1 blocks) cpu  lose c_leak.c:3"
 grep -q "LeakSanitizer: detected memory leaks" "$w/c_leak_asan.err" && ok "c_leak_asan ASan still reports" || bad c_leak_asan "no ASan report ($w/c_leak_asan.err)"
 clang -O0 -g -fsanitize=address -o build/c_leak_sasan tests/c_leak.c
 ./heaptide run --out "$w/c_leak_sasan" -- build/c_leak_sasan 2> "$w/c_leak_sasan.err" >/dev/null || true
@@ -91,7 +92,7 @@ grep -q "links ASan statically" "$w/c_leak_sasan.err" && ok "c_leak_sasan static
 run c_forkmt -- build/c_forkmt
 # a child shows its 200000 B leak, never an inherited block (a damaged table would leak those)
 expect c_forkmt children_leak "$(grep -c " direct=200000 " "$w/c_forkmt.err" || true)" 200
-rm -rf "$w/c_forkmt1"; mkdir -p "$w/c_forkmt1"; cp "$(ls "$w"/c_forkmt/heaptide.*.bin | head -1)" "$w/c_forkmt1/"
+rm -rf "$w/c_forkmt1"; mkdir -p "$w/c_forkmt1"; fb=("$w"/c_forkmt/heaptide.*.bin); cp "${fb[0]}" "$w/c_forkmt1/"
 ./build/heaptide_report "$w/c_forkmt1" > "$w/c_forkmt.txt" 2>&1 || true
 [[ $(cat "$w/c_forkmt.txt") != *"   18446744"* ]] && ok "c_forkmt no negative site" || bad c_forkmt "negative site ($w/c_forkmt.txt)"
 

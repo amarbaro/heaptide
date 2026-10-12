@@ -4,27 +4,49 @@
 # heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline all|sites,streams,frag] [--out DIR] -- CMD...
 # heaptide report DIR [args]   |   heaptide snapshot DIR (running process writes a report now)
 # heaptide attach PID [--out DIR]   (a running process: gdb loads heaptide into it; root under Yama 1)
+# heaptide detach DIR   (a last snapshot, then the process runs on untracked: no restart)
+# heaptide flame DIR [-o OUT.html] [--open]   (an interactive flame graph, one offline HTML file)
 # heaptide diff BASE_DIR NEW_DIR [--fail-on new|grown|none] [--json] [--top N]   (exit 1: a new leak site)
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 case "${1:-}" in
   report) shift; exec "$here/build/heaptide_report" "$@" ;;
   snapshot) [[ -d ${2:-} ]] || { echo "FAIL heaptide: snapshot needs the run's --out DIR" >&2; exit 2; }
-            : > "$2/snapshot"; echo "heaptide: snapshot requested; the process writes it within --every ms" >&2; exit 0 ;;
+            s=$2/.snapshot_req; : > "$s"; : > "$2/snapshot"  # returns once a report newer than the request is in place
+            for _ in $(seq 600); do [[ ! -e $2/snapshot && -n $(find "$2" -maxdepth 1 -name 'heaptide.*.bin' -newer "$s" -print -quit) ]] && { rm -f "$s"; echo "heaptide: snapshot written to $2" >&2; exit 0; }; sleep 0.1; done
+            rm -f "$s" "$2/snapshot"; echo "FAIL heaptide: no report in $2 within 60 s (process gone, or the snapshot was skipped: see its stderr)" >&2; exit 1 ;;
+  detach) [[ -d ${2:-} ]] || { echo "FAIL heaptide: detach needs the attach (or run) --out DIR" >&2; exit 2; }
+          rc=0; "$here/heaptide" snapshot "$2" || rc=1
+          : > "$2/detach"  # the process removes it once detached
+          for _ in $(seq 100); do [[ -e $2/detach ]] || { echo "heaptide: detached; the process runs on untracked" >&2; exit $rc; }; sleep 0.1; done
+          rm -f "$2/detach"; echo "FAIL heaptide: not detached within 10 s (process gone?)" >&2; exit 1 ;;
+  flame) use="FAIL heaptide: flame DIR [-o OUT.html] [--open]"; [[ -d ${2:-} ]] || { echo "$use" >&2; exit 2; }
+         dir=$2; o=$2/flame.html; op=0; shift 2
+         while (( $# )); do case $1 in -o) o=${2:?$use}; shift ;; --open) op=1 ;; *) echo "$use" >&2; exit 2 ;; esac; shift; done
+         d=$(mktemp "${TMPDIR:-/tmp}/heaptide-flame.XXXXXX"); trap 'rm -f "$d"' EXIT
+         "$here/build/heaptide_report" "$dir" --flame-data > "$d" || exit 2
+         sed -i 's#</#<\\/#g' "$d"  # inside a <script> block "</script" must not appear
+         awk -v d="$d" '{ i = index($0, "/*HEAPTIDE_DATA*/"); if (!i) { print; next }
+           printf "%s", substr($0, 1, i - 1); while ((getline l < d) > 0) printf "%s", l; print substr($0, i + 17) }' "$here/report/flame.html" > "$o"
+         echo "heaptide: flame graph written to $o ($(( $(stat -c %s "$o") / 1024 )) KiB)" >&2
+         (( op )) && setsid xdg-open "$o" > /dev/null 2>&1 < /dev/null &
+         exit 0 ;;
   diff) [[ -d ${2:-} && -d ${3:-} ]] || { echo "FAIL heaptide: diff needs two report DIRs" >&2; exit 2; }
         t=$(mktemp -d "${TMPDIR:-/tmp}/heaptide-diff.XXXXXX"); trap 'rm -rf "$t"' EXIT; top=(); [[ ${4:-} == --top ]] && top=(--top "$5")
         for x in 2 3; do "$here/build/heaptide_report" "${!x}" --fail-on none "${top[@]}" --sites "$t/$x" >/dev/null || exit 2; done
         "$here/build/heaptide_report" --diff "$t/2" "$t/3" "${@:4}"; exit $? ;;
   attach) [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "FAIL heaptide: attach PID [--out DIR]" >&2; exit 2; }
           out=${4:-.work/heaptide}; [[ ${3:-} == --out || -z ${3:-} ]] || { echo "FAIL heaptide: attach PID [--out DIR]" >&2; exit 2; }
+          ! grep -q libheaptide "/proc/$2/maps" 2>/dev/null || { echo "FAIL heaptide: $2 has heaptide loaded already (attached, or inert after detach: dlopen would return that copy and hook nothing); restart it to attach again" >&2; exit 2; }
           mkdir -p "$out"; o=$(readlink -f "$out")
+          (( EUID )) || chown "$(stat -c %u:%g "/proc/$2")" "$o"  # under sudo: the target writes its report here
           r=$(gdb -p "$2" -batch -nx -ex "call (int)setenv(\"HEAPTIDE_OUT\",\"$o\",1)" -ex 'call (int)setenv("HEAPTIDE_ATTACH","1",1)' \
                 -ex "call (void*)dlopen(\"$here/build/libheaptide.so\",2)" 2>&1) || true
           grep -q '^\$3 = (void \*) 0x[1-9a-f]' <<<"$r" || { echo "FAIL heaptide: attach to $2 failed (Yama ptrace_scope $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo ?): run it with sudo, or as the process's parent)" >&2
             grep -iE 'ptrace|denied|error|No symbol' <<<"$r" | head -3 >&2; exit 2; }
           echo "heaptide: attached to $2; heaptide snapshot $o, or the report at its exit" >&2; exit 0 ;;
   run) shift ;;
-  *) echo "usage: heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline PARTS] [--out DIR] -- CMD... | heaptide report DIR [--json] [--top N] | heaptide snapshot DIR | heaptide diff BASE NEW [--fail-on new|grown|none] | heaptide attach PID [--out DIR]" >&2; exit 2 ;;
+  *) echo "usage: heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline PARTS] [--out DIR] -- CMD... | heaptide report DIR [--json] [--top N] | heaptide snapshot DIR | heaptide diff BASE NEW [--fail-on new|grown|none] | heaptide attach PID [--out DIR] | heaptide detach DIR | heaptide flame DIR [-o OUT.html] [--open]" >&2; exit 2 ;;
 esac
 out=.work/heaptide; py=0; pyd=1
 while [[ $# -gt 0 && $1 != -- ]]; do
@@ -52,9 +74,9 @@ mkdir -p "$out"; export HEAPTIDE_OUT=$(readlink -f "$out")
 if (( py )); then
   export HEAPTIDE_PY=1
   [[ $(basename "$1") == python* ]] || { echo "FAIL heaptide: --py needs a python command" >&2; exit 2; }
-  export HEAPTIDE_DEPTH=${HEAPTIDE_DEPTH:-8}  # tracemalloc gives the Python lines; native frames past 8 only split sites
+  export HEAPTIDE_DEPTH=${HEAPTIDE_DEPTH:-8} HEAPTIDE_PY_DEPTH=$pyd  # the Python lines come from the shim's hooks; native frames past 8 only split sites
   perf=(); "$1" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2>/dev/null && perf=(-X perf)  # Python frames in native stacks
-  exe=$1; shift; set -- "$exe" "${perf[@]}" -X tracemalloc=$pyd "$here/py/run.py" "$@"
+  exe=$1; shift; set -- "$exe" "${perf[@]}" "$here/py/run.py" "$@"
 fi
 # static ASan (clang's default) defines malloc in the program itself, ahead of any preload
 exe=$(command -v "$1" || true)

@@ -1,0 +1,597 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 · Copyright 2026 AMARBARO · amarbaro.org labs -->
+<!-- heaptide flame: one self-contained page, no network. The data block is spliced in by `heaptide flame`. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heaptide flame</title>
+<style>
+:root {
+  --bg: #0b0d12; --bg2: #11141b; --panel: rgba(18, 22, 31, .78); --line: rgba(255, 255, 255, .07);
+  --text: #e7eaf0; --muted: #8a93a6; --faint: #5b6375; --accent: #ffb454; --accent-ink: #1a1206;
+  --hit: #ffe066; --ok: #5ee0a0; --warn: #ff7a6b; --shadow: 0 12px 40px rgba(0, 0, 0, .45);
+  --ui: system-ui, -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, monospace;
+  --ease-out: cubic-bezier(.23, 1, .32, 1);
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg: #f6f7f9; --bg2: #ffffff; --panel: rgba(255, 255, 255, .8); --line: rgba(15, 20, 30, .08);
+  --text: #171b24; --muted: #5d6576; --faint: #9aa1b0; --accent: #d9790f; --accent-ink: #fff;
+  --hit: #f2c500; --shadow: 0 12px 40px rgba(20, 30, 50, .14);
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 var(--ui); }
+body { display: grid; grid-template-rows: auto auto 1fr auto; overflow: hidden; }
+button, input, select { font: inherit; color: inherit; }
+.num { font-variant-numeric: tabular-nums; }
+
+header {
+  position: relative; z-index: 3; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+  backdrop-filter: saturate(160%) blur(14px); -webkit-backdrop-filter: saturate(160%) blur(14px);
+}
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
+.brand i { width: 18px; height: 18px; border-radius: 5px; background: conic-gradient(from 200deg, #ffb454, #ff7a59, #b07cff, #4fd1c5, #ffb454); }
+.brand small { color: var(--muted); font-weight: 450; }
+.seg { display: inline-flex; padding: 3px; gap: 2px; border-radius: 10px; background: var(--line); }
+.seg button {
+  border: 0; background: transparent; padding: 5px 10px; border-radius: 7px; cursor: pointer; color: var(--muted);
+  transition: background-color 150ms ease, color 150ms ease;
+}
+.seg button b { display: block; font-size: 11px; font-weight: 500; color: var(--faint); }
+.seg button[aria-pressed="true"] { background: var(--bg2); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, .25); }
+.seg button[aria-pressed="true"] b { color: var(--accent); }
+.seg button:active { transform: scale(.97); }
+.chips { display: inline-flex; gap: 6px; }
+.chip {
+  border: 1px solid var(--line); background: transparent; padding: 4px 9px; border-radius: 999px; cursor: pointer;
+  color: var(--muted); display: inline-flex; align-items: center; gap: 6px; transition: color 150ms ease, border-color 150ms ease;
+}
+.chip i { width: 8px; height: 8px; border-radius: 50%; }
+.chip[aria-pressed="true"] { color: var(--text); border-color: color-mix(in srgb, var(--text) 25%, transparent); }
+.chip:active { transform: scale(.97); }
+.spacer { flex: 1; }
+.search { position: relative; }
+.search input {
+  width: 240px; padding: 6px 10px 6px 28px; border-radius: 9px; border: 1px solid var(--line); background: var(--bg2); outline: none;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+.search input:focus { border-color: color-mix(in srgb, var(--accent) 60%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.search svg { position: absolute; left: 9px; top: 50%; translate: 0 -50%; opacity: .55; }
+.search kbd { position: absolute; right: 8px; top: 50%; translate: 0 -50%; }
+kbd { font: 11px var(--mono); padding: 1px 5px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); background: var(--bg); }
+select { background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; }
+
+#strip { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 16px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
+#crumbs { display: flex; gap: 4px; flex-wrap: wrap; min-width: 0; font: 12px var(--mono); }
+#crumbs button { border: 0; background: var(--line); border-radius: 6px; padding: 2px 8px; cursor: pointer; color: var(--muted); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#crumbs button:last-child { color: var(--text); background: color-mix(in srgb, var(--accent) 20%, transparent); }
+#crumbs span { color: var(--faint); align-self: center; }
+#timeline { width: 360px; height: 40px; display: block; border-radius: 8px; background: var(--bg2); }
+.tlwrap { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+
+main { position: relative; display: grid; grid-template-columns: 1fr 340px; min-height: 0; }
+#view { position: relative; overflow: auto; min-height: 0; }
+#view canvas { display: block; }
+aside { border-left: 1px solid var(--line); background: var(--bg2); overflow: auto; min-height: 0; }
+aside h3 { margin: 0; padding: 14px 16px 8px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); font-weight: 600; }
+#detail { padding: 0 16px 12px; }
+#detail .name { font: 600 13px var(--mono); word-break: break-all; }
+#detail .loc { font: 12px var(--mono); color: var(--muted); margin-top: 4px; word-break: break-all; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.stat { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+.stat b { display: block; font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
+.stat span { font-size: 11px; color: var(--muted); }
+.bar { height: 4px; border-radius: 2px; background: var(--line); margin-top: 6px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+td { padding: 5px 16px 5px 0; border-top: 1px solid var(--line); vertical-align: top; }
+td:first-child { padding-left: 16px; font-family: var(--mono); word-break: break-all; }
+thead td { color: var(--faint); font-size: 11px; border-top: 0; cursor: default; }
+td.r { text-align: right; white-space: nowrap; color: var(--muted); }
+tr { cursor: pointer; }
+tr:hover td { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+#python { padding: 0 16px 16px; font: 11px/1.5 var(--mono); color: var(--muted); white-space: pre-wrap; word-break: break-all; }
+
+#tip {
+  position: fixed; z-index: 10; pointer-events: none; max-width: 520px; padding: 10px 12px; border-radius: 12px;
+  background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow); backdrop-filter: blur(12px);
+  opacity: 0; translate: 0 4px; transition: opacity 120ms ease, translate 120ms var(--ease-out);
+}
+#tip.on { opacity: 1; translate: 0 0; }
+#tip .n { font: 600 12px var(--mono); word-break: break-all; }
+#tip .l { font: 11px var(--mono); color: var(--muted); margin-top: 2px; word-break: break-all; }
+#tip .v { margin-top: 6px; display: flex; gap: 14px; font-size: 12px; }
+#tip .v b { font-weight: 650; }
+.cat { display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; padding: 1px 6px; border-radius: 5px; margin-left: 6px; vertical-align: 1px; }
+
+footer { display: flex; gap: 18px; padding: 6px 16px; border-top: 1px solid var(--line); color: var(--faint); font-size: 11px; }
+footer span { white-space: nowrap; }
+.empty[hidden] { display: none; }
+.empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 14px; }
+@media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { display: none; } #timeline { width: 200px; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><i></i>heaptide <small>flame</small></div>
+  <select id="proc" title="process"></select>
+  <div class="seg" id="metrics"></div>
+  <div class="chips" id="kinds"></div>
+  <div class="seg" id="modes">
+    <button data-k="invert" title="callers of each allocating function (i)">Inverted</button>
+    <button data-k="flip" title="root at the bottom (f)">Flame</button>
+    <button data-k="system" title="hide libc, loader and runtime frames (s)">Hide system</button>
+  </div>
+  <div class="spacer"></div>
+  <label class="search"><svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7" cy="7" r="5"/><path d="m11 11 4 4"/></svg>
+    <input id="q" placeholder="Search functions, files" spellcheck="false" autocomplete="off"><kbd>/</kbd></label>
+  <button class="chip" id="theme" title="light / dark"><svg width="14" height="14" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1.5a6.5 6.5 0 0 1 0 13z" fill="currentColor"/></svg></button>
+</header>
+<div id="strip">
+  <nav id="crumbs"></nav>
+  <div class="tlwrap"><span id="tlnote"></span><canvas id="timeline"></canvas></div>
+</div>
+<main>
+  <div id="view"><canvas id="fg"></canvas><div class="empty" id="empty" hidden>Nothing recorded for this metric.</div></div>
+  <aside>
+    <h3>Selection</h3><div id="detail"></div>
+    <h3>Top functions</h3><table><thead><tr><td></td><td class="r">self</td><td class="r">total</td></tr></thead><tbody id="topfn"></tbody></table>
+    <div id="pywrap" hidden><h3>Python lines</h3><div id="python"></div></div>
+  </aside>
+</main>
+<footer><span id="fstat"></span><span><kbd>click</kbd> zoom · <kbd>esc</kbd> reset · <kbd>/</kbd> search · <kbd>1</kbd>-<kbd>5</kbd> metric · <kbd>i</kbd> inverted · <kbd>f</kbd> flame · <kbd>s</kbd> system · <kbd>←↑→↓</kbd> walk</span></footer>
+<div id="tip"></div>
+
+<script id="ht-data" type="application/json">/*HEAPTIDE_DATA*/</script>
+
+<script id="ht-core">
+"use strict";
+// Pure tree logic, no DOM: tests/flame_check.mjs runs this block in node.
+const KINDS = ["cpu", "gpu", "host", "mmap"];
+const CATS = ["user", "python", "system", "jit"];
+const SYS = -50;  // key of the one box that stands for a path of system frames only (kinds are -1 .. -4)
+
+// A process from the report: nodes in creation order (a parent before its children), self weights per metric.
+function buildBase(p) {
+  const n = p.nodes.parent.length, frame = Int32Array.from(p.nodes.frame);
+  const self = p.nodes.self.map(a => Float64Array.from(a));
+  // node label: process, kind, or frame (function, file, line, category)
+  const label = i => {
+    const f = frame[i];
+    if (f === -100) return { name: `${p.exe.split("/").pop()} (${p.pid})`, file: "", line: 0, cat: "root" };
+    if (f < 0) return { name: `[${KINDS[-1 - f]}]`, file: "", line: 0, cat: KINDS[-1 - f] };
+    return { name: p.names[p.frames.name[f]], file: p.files[p.frames.file[f]], line: p.frames.line[f], cat: CATS[p.frames.cat[f]] };
+  };
+  return { n, parent: Int32Array.from(p.nodes.parent), frame, self, label, kind: kindOf(p.nodes.parent, frame) };
+}
+function kindOf(parent, frame) {  // each node's kind (index into KINDS), -1 for the root
+  const k = new Int8Array(parent.length).fill(-1);
+  for (let i = 1; i < parent.length; i++) k[i] = frame[i] < 0 && frame[i] > -100 ? -1 - frame[i] : k[parent[i]];
+  return k;
+}
+
+// The tree shown: built from every base node's path (root -> node) carrying that node's self weights.
+// opts.invert: path reversed below the kind (allocating function first); opts.system: system frames dropped;
+// opts.kinds: kinds kept. Keys are frame identities, so equal paths merge.
+function derive(b, opts) {
+  const parent = [-1], key = [-100], self = b.self.map(() => [0]), kids = [new Map()];
+  const path = [];
+  const sysFrame = i => b.frame[i] >= 0 && b.label(i).cat === "system";
+  for (let i = 1; i < b.n; i++) {
+    let w = 0;
+    for (const s of b.self) w += s[i];
+    if (!w || (b.kind[i] >= 0 && !opts.kinds[b.kind[i]])) continue;
+    path.length = 0;
+    for (let j = i; j > 0; j = b.parent[j]) path.push(j);  // node .. kind
+    path.reverse();  // kind .. node
+    let frames = path.slice(1).filter(j => !(opts.system && sysFrame(j)));
+    if (opts.system && frames.length === 0 && path.length > 1 && b.frame[i] >= 0) frames = [SYS];  // only system frames: one "(system)" box
+    if (opts.invert) frames.reverse();
+    let cur = 0;
+    for (const j of [path[0], ...frames]) {
+      const k = j === SYS ? SYS : b.frame[j];
+      let c = kids[cur].get(k);
+      if (c === undefined) {
+        c = parent.length; parent.push(cur); key.push(k); kids.push(new Map()); kids[cur].set(k, c);
+        for (const s of self) s.push(0);
+      }
+      cur = c;
+    }
+    for (let m = 0; m < self.length; m++) self[m][cur] += b.self[m][i];
+  }
+  const n = parent.length;
+  return { n, parent: Int32Array.from(parent), key: Int32Array.from(key), self: self.map(a => Float64Array.from(a)) };
+}
+
+// Totals and a left-heavy child order (heaviest first) for one metric.
+function weigh(t, m) {
+  const total = Float64Array.from(t.self[m]);
+  for (let i = t.n - 1; i > 0; i--) total[t.parent[i]] += total[i];
+  const first = new Int32Array(t.n).fill(-1), next = new Int32Array(t.n).fill(-1), depth = new Int32Array(t.n);
+  const kids = Array.from({ length: t.n }, () => []);
+  for (let i = 1; i < t.n; i++) { kids[t.parent[i]].push(i); depth[i] = depth[t.parent[i]] + 1; }
+  let maxDepth = 0;
+  for (let i = 0; i < t.n; i++) {
+    const k = kids[i].filter(c => total[c] > 0).sort((a, b) => total[b] - total[a]);
+    if (k.length) first[i] = k[0];
+    for (let j = 0; j + 1 < k.length; j++) next[k[j]] = k[j + 1];
+    if (total[i] > 0 && depth[i] > maxDepth) maxDepth = depth[i];
+  }
+  const x = new Float64Array(t.n);  // left edge in bytes from the root's left edge
+  const stack = [0];
+  while (stack.length) {
+    const i = stack.pop();
+    let at = x[i];
+    for (let c = first[i]; c >= 0; c = next[c]) { x[c] = at; at += total[c]; stack.push(c); }
+  }
+  return { total, first, next, depth, x, maxDepth };
+}
+
+// Per function name: self and total (a name counted once per path), heaviest first.
+function topFunctions(t, w, nameOf, m, limit) {
+  const self = new Map(), total = new Map(), onPath = new Map();
+  const visit = (i) => {
+    const nm = nameOf(i), fresh = !onPath.get(nm);
+    if (i > 0) {
+      self.set(nm, (self.get(nm) || 0) + t.self[m][i]);
+      if (fresh) total.set(nm, (total.get(nm) || 0) + w.total[i]);
+    }
+    onPath.set(nm, (onPath.get(nm) || 0) + 1);
+    for (let c = w.first[i]; c >= 0; c = w.next[c]) visit(c);
+    onPath.set(nm, onPath.get(nm) - 1);
+  };
+  if (t.n) visit(0);
+  return [...total.entries()].map(([name, tot]) => ({ name, total: tot, self: self.get(name) || 0 }))
+    .sort((a, b) => b.self - a.self || b.total - a.total).slice(0, limit);
+}
+
+function human(b) {
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return (i ? b.toFixed(b < 10 ? 2 : b < 100 ? 1 : 0) : Math.round(b)) + " " + u[i];
+}
+// Share of a metric's bytes whose path holds a frame of the user's own (code, Python, JIT): hiding system
+// frames only helps when most of it does (a Python program seen natively is all libpython).
+function userShare(b, m) {
+  const own = new Uint8Array(b.n);
+  let mine = 0, all = 0;
+  for (let i = 1; i < b.n; i++) {
+    own[i] = own[b.parent[i]] || (b.frame[i] >= 0 && b.label(i).cat !== "system");
+    all += b.self[m][i]; if (own[i]) mine += b.self[m][i];
+  }
+  return all ? mine / all : 0;
+}
+if (typeof module !== "undefined") module.exports = { buildBase, derive, weigh, topFunctions, userShare, human, KINDS, CATS, SYS };
+</script>
+
+<script>
+"use strict";
+window.__errs = [];
+addEventListener("error", e => window.__errs.push(String(e.message)));
+const DATA = JSON.parse(document.getElementById("ht-data").textContent);
+const METRICS = [["leaked", "Leaked"], ["live", "Live"], ["peak", "Peak"], ["allocated", "Allocated"], ["temporaries", "Temporaries"]];
+const $ = id => document.getElementById(id);
+const root = document.documentElement;
+const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const S = {
+  proc: 0, metric: 0, invert: false, flip: false, system: true, kinds: [true, true, true, true],
+  zoom: 0, zx: 0, zw: 1, sel: -1, hover: -1, query: null,
+  theme: /dark|light/.test(location.search + location.hash) ? (location.search + location.hash).match(/dark|light/)[0] : matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark",
+};
+let B, T, W, drawn, matched = new Uint8Array(0), matchBytes = 0, cv = $("fg"), ctx = cv.getContext("2d", { alpha: false });
+const ROW = 20, GAP = 1, FONT = "11.5px " + getComputedStyle(root).getPropertyValue("--mono");
+const stats = { nodes: 0, drawn: 0, ms: 0, frames: 0 };
+window.__ht = { stats, S, data: DATA };
+
+// ---------- colors ----------
+const HUE = { user: 32, python: 268, system: 220, jit: 330, cpu: 210, gpu: 172, host: 195, mmap: 150, root: 220 };
+function hash(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619); return (h >>> 0) / 4294967296; }
+function fill(lab, selfFrac) {
+  const dark = S.theme === "dark", h = HUE[lab.cat] ?? 32, j = hash(lab.name);
+  const sys = lab.cat === "system" || lab.cat === "root";
+  const lib = sys && lab.file ? hash(lab.file.split("/").slice(-2).join("/")) : j;  // a library keeps one tint
+  const hue = sys ? 200 + lib * 45 : h + (j - .5) * (lab.cat === "user" ? 26 : 14);
+  const sat = sys ? 16 + lib * 16 : lab.cat === "user" ? 82 : 62;
+  const lit = (dark ? 46 : 70) + j * 8 + selfFrac * (dark ? 14 : 8) - (sys ? (dark ? 14 : 0) : 0);
+  return `hsl(${hue.toFixed(1)} ${sat.toFixed(0)}% ${lit.toFixed(1)}%)`;
+}
+const ink = () => S.theme === "dark" ? "rgba(8,10,14,.92)" : "rgba(15,18,25,.9)";
+
+// ---------- model ----------
+function labelOf(i) {
+  const k = T.key[i];
+  if (k === -100) return B.label(0);
+  if (k === SYS) return { name: "(system)", file: "", line: 0, cat: "system" };
+  if (k < 0) return { name: `[${KINDS[-1 - k]}]`, file: "", line: 0, cat: KINDS[-1 - k] };
+  const p = DATA[S.proc];
+  return { name: p.names[p.frames.name[k]], file: p.files[p.frames.file[k]], line: p.frames.line[k], cat: CATS[p.frames.cat[k]] };
+}
+function rebuild() {
+  B = buildBase(DATA[S.proc]);
+  T = derive(B, { invert: S.invert, system: S.system, kinds: S.kinds });
+  stats.nodes = T.n;
+  reweigh();
+}
+function reweigh() {
+  W = weigh(T, S.metric);
+  if (S.zoom >= T.n || !(W.total[S.zoom] > 0)) S.zoom = 0;
+  setZoom(S.zoom, true);
+  runSearch();
+  renderSide();
+}
+function setZoom(i, instant) {
+  const tot = W.total[0] || 1, tx = W.x[i] / tot, tw = Math.max(W.total[i] / tot, 1e-12);
+  S.zoom = i;
+  crumbs();
+  if (instant || reduced) { S.zx = tx; S.zw = tw; draw(); return; }
+  const fx = S.zx, fw = S.zw, t0 = performance.now(), dur = 200;
+  const step = now => {
+    const t = Math.min(1, (now - t0) / dur), e = 1 - Math.pow(1 - t, 4);  // strong ease-out
+    S.zx = fx + (tx - fx) * e; S.zw = fw + (tw - fw) * e; draw();
+    if (t < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// ---------- drawing ----------
+function size() {
+  const view = $("view"), dpr = devicePixelRatio || 1, w = view.clientWidth;
+  const h = Math.max(view.clientHeight, (W.maxDepth + 2) * ROW + 8);
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); cv.style.width = w + "px"; cv.style.height = h + "px";
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [w, h];
+}
+let charW = 7;
+function draw() {
+  const t0 = performance.now(), [w, h] = size(), tot = W.total[0] || 1;
+  const bg = getComputedStyle(root).getPropertyValue("--bg");
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, w, h);
+  $("empty").hidden = W.total[0] > 0;
+  ctx.font = FONT; ctx.textBaseline = "middle"; charW = ctx.measureText("0000000000").width / 10;
+  const scale = w / (S.zw * tot), x0 = S.zx * tot, zd = W.depth[S.zoom];
+  drawn = [];
+  const ys = d => S.flip ? h - (d + 1) * ROW - 4 : d * ROW + 4;
+  const searching = S.query !== null;
+  // ancestors of the zoomed node: full-width rows above it
+  const stack = [0];
+  let n = 0;
+  while (stack.length) {
+    const i = stack.pop(), d = W.depth[i];
+    const left = (W.x[i] - x0) * scale, width = W.total[i] * scale;
+    if (left > w || left + width < 0) continue;
+    const L = Math.max(left, -2), R = Math.min(left + width, w + 2), bw = R - L;
+    if (bw < .35) continue;
+    const lab = labelOf(i), y = ys(d);
+    const selfFrac = W.total[i] ? T.self[S.metric][i] / W.total[i] : 0;
+    ctx.globalAlpha = searching && !matched[i] ? .28 : (d < zd ? .55 : 1);
+    ctx.fillStyle = fill(lab, selfFrac);
+    if (bw > 6) { ctx.beginPath(); ctx.roundRect(L + GAP / 2, y, bw - GAP, ROW - GAP, 3.5); ctx.fill(); }
+    else ctx.fillRect(L, y, Math.max(bw - GAP / 2, .35), ROW - GAP);
+    if (searching && matched[i]) { ctx.globalAlpha = 1; ctx.strokeStyle = getComputedStyle(root).getPropertyValue("--hit"); ctx.lineWidth = 1.5; ctx.strokeRect(L + 1, y + .75, Math.max(bw - 2, 0), ROW - 2.5); }
+    if (i === S.sel || i === S.hover) { ctx.globalAlpha = 1; ctx.strokeStyle = S.theme === "dark" ? "#fff" : "#111"; ctx.lineWidth = i === S.sel ? 2 : 1; ctx.strokeRect(L + 1, y + 1, Math.max(bw - 2, 0), ROW - 3); }
+    const chars = Math.floor((bw - 10) / charW);
+    if (chars >= 3) {
+      ctx.globalAlpha = searching && !matched[i] ? .45 : 1;
+      ctx.fillStyle = ink();
+      const s = lab.name.length > chars ? lab.name.slice(0, chars - 1) + "…" : lab.name;
+      ctx.fillText(s, Math.max(L, 0) + 5, y + ROW / 2);
+    }
+    drawn.push(i); n++;
+    // children: heaviest first; once one is too thin, the rest are too
+    const kids = [];
+    for (let c = W.first[i]; c >= 0; c = W.next[c]) {
+      if (W.total[c] * scale < .35) break;
+      kids.push(c);
+    }
+    for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k]);
+  }
+  ctx.globalAlpha = 1;
+  stats.drawn = n; stats.ms = performance.now() - t0; stats.frames++;
+  $("fstat").textContent = `${T.n.toLocaleString()} nodes · ${n.toLocaleString()} drawn · ${stats.ms.toFixed(1)} ms`;
+}
+function hit(mx, my) {
+  const [w, h] = [cv.clientWidth, cv.clientHeight], tot = W.total[0] || 1, scale = w / (S.zw * tot), x0 = S.zx * tot;
+  const d = S.flip ? Math.floor((h - my - 4) / ROW) : Math.floor((my - 4) / ROW);
+  for (const i of drawn) {
+    if (W.depth[i] !== d) continue;
+    const left = (W.x[i] - x0) * scale;
+    if (mx >= left && mx < left + W.total[i] * scale) return i;
+  }
+  return -1;
+}
+
+// ---------- panels ----------
+function metricTotal(m) { return DATA[S.proc].totals[m]; }
+function pct(a, b) { return b ? (100 * a / b).toFixed(a / b < .1 ? 2 : 1) + "%" : "0%"; }
+function catChip(c) { return `<span class="cat" style="background:hsl(${HUE[c] ?? 220} 60% 50% / .22);color:hsl(${HUE[c] ?? 220} 80% ${S.theme === "dark" ? 72 : 35}%)">${c}</span>`; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+function where(lab) { return lab.file ? `${lab.file}${lab.line ? ":" + lab.line : ""}` : ""; }
+function renderDetail(i) {
+  const el = $("detail");
+  if (i < 0) { el.innerHTML = `<div class="loc">Hover or click a frame.</div>`; return; }
+  const lab = labelOf(i), tot = W.total[0] || 1, par = i > 0 ? W.total[T.parent[i]] : W.total[i];
+  el.innerHTML = `<div class="name">${esc(lab.name)}${catChip(lab.cat)}</div><div class="loc">${esc(where(lab))}</div>
+  <div class="stats">
+    <div class="stat"><b class="num">${human(W.total[i])}</b><span>total · ${pct(W.total[i], tot)}</span><div class="bar"><i style="width:${(100 * W.total[i] / tot).toFixed(2)}%"></i></div></div>
+    <div class="stat"><b class="num">${human(T.self[S.metric][i])}</b><span>self · ${pct(T.self[S.metric][i], tot)}</span><div class="bar"><i style="width:${(100 * T.self[S.metric][i] / tot).toFixed(2)}%"></i></div></div>
+    <div class="stat"><b class="num">${pct(W.total[i], par)}</b><span>of its parent</span></div>
+    <div class="stat"><b class="num">${W.depth[i]}</b><span>depth</span></div>
+  </div>`;
+}
+function renderSide() {
+  renderDetail(S.sel);
+  const top = topFunctions(T, W, i => labelOf(i).name, S.metric, 40).filter(r => !/^\[(cpu|gpu|host|mmap)\]$/.test(r.name)).slice(0, 30), tot = W.total[0] || 1;
+  $("topfn").innerHTML = top.map(r => `<tr data-n="${esc(r.name)}"><td>${esc(r.name)}</td><td class="r num">${human(r.self)}</td><td class="r num">${human(r.total)}<br><small>${pct(r.total, tot)}</small></td></tr>`).join("") ||
+    `<tr><td>nothing recorded</td><td></td><td></td></tr>`;
+  const py = DATA[S.proc].python || [];
+  $("pywrap").hidden = !py.length;
+  $("python").textContent = py.join("\n");
+}
+function crumbs() {
+  const path = [];
+  for (let i = S.zoom; i >= 0; i = i > 0 ? T.parent[i] : -1) path.unshift(i);
+  $("crumbs").innerHTML = path.map(i => `<button data-i="${i}" title="${esc(labelOf(i).name)}">${esc(labelOf(i).name)}</button>`).join("<span>›</span>");
+}
+function runSearch() {
+  const q = $("q").value.trim();
+  matched = new Uint8Array(T.n); matchBytes = 0;
+  if (!q) { S.query = null; $("q").title = ""; return; }
+  let re;
+  try { re = new RegExp(q, "i"); } catch { re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); }
+  S.query = re;
+  for (let i = 1; i < T.n; i++) { const l = labelOf(i); if (re.test(l.name) || re.test(l.file)) matched[i] = 1; }
+  // bytes under a match, each byte once: a node counts when no ancestor matched
+  const covered = new Uint8Array(T.n);
+  for (let i = 1; i < T.n; i++) {
+    covered[i] = covered[T.parent[i]] || matched[i];
+    if (matched[i] && !covered[T.parent[i]]) matchBytes += W.total[i];
+  }
+  $("q").title = `${pct(matchBytes, W.total[0])} of ${METRICS[S.metric][1].toLowerCase()} (${human(matchBytes)})`;
+}
+function timeline() {
+  const c = $("timeline"), p = DATA[S.proc], s = p.samples, dpr = devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const n = s.t.length;
+  c.hidden = n < 2;
+  $("tlnote").innerHTML = n >= 2 ? `${p.attached ? "attached · " : ""}live <b class="num">${human(Math.max(...s.cpu))}</b> peak${Math.max(...s.gpu) ? ` · gpu <b class="num">${human(Math.max(...s.gpu))}</b>` : ""} · ${s.t[n - 1]} s` : "run too short for a timeline";
+  if (n < 2) return;
+  const tmax = s.t[n - 1] || 1;
+  for (const [arr, hue] of [[s.cpu, 32], [s.gpu, 172]]) {
+    const vmax = Math.max(...arr);
+    if (!vmax) continue;
+    const grad = g.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, `hsl(${hue} 90% 60% / .55)`); grad.addColorStop(1, `hsl(${hue} 90% 60% / 0)`);
+    g.beginPath(); g.moveTo(0, h);
+    for (let i = 0; i < n; i++) g.lineTo(s.t[i] / tmax * w, h - 3 - arr[i] / vmax * (h - 8));
+    g.lineTo(w, h); g.closePath(); g.fillStyle = grad; g.fill();
+    g.beginPath();
+    for (let i = 0; i < n; i++) g[i ? "lineTo" : "moveTo"](s.t[i] / tmax * w, h - 3 - arr[i] / vmax * (h - 8));
+    g.strokeStyle = `hsl(${hue} 90% 62%)`; g.lineWidth = 1.5; g.stroke();
+  }
+}
+
+// ---------- controls ----------
+function controls() {
+  $("proc").innerHTML = DATA.map((p, i) => `<option value="${i}">${esc(p.exe.split("/").pop())} · ${p.pid}</option>`).join("");
+  $("proc").hidden = DATA.length < 2;
+  $("metrics").innerHTML = METRICS.map(([, t], m) => `<button data-m="${m}">${t}<b class="num">${m === 4 ? metricTotal(m).toLocaleString() : human(metricTotal(m))}</b></button>`).join("");
+  const present = KINDS.map((k, i) => B.kind.some((v, j) => v === i && B.frame[j] === -1 - i));
+  $("kinds").innerHTML = KINDS.map((k, i) => present[i] ? `<button class="chip" data-k="${i}"><i style="background:hsl(${HUE[k]} 70% 55%)"></i>${k}</button>` : "").join("");
+  sync();
+}
+function sync() {
+  root.dataset.theme = S.theme;
+  document.querySelectorAll("#metrics button").forEach(b => b.setAttribute("aria-pressed", +b.dataset.m === S.metric));
+  document.querySelectorAll("#kinds button").forEach(b => b.setAttribute("aria-pressed", S.kinds[+b.dataset.k]));
+  document.querySelectorAll("#modes button").forEach(b => b.setAttribute("aria-pressed", S[b.dataset.k]));
+}
+const act = {
+  metric(m) { S.metric = m; sync(); reweigh(); },
+  toggle(k) { S[k] = !S[k]; sync(); if (k === "flip") { draw(); } else { S.zoom = 0; S.sel = -1; rebuild(); } },
+  kind(i) { S.kinds[i] = !S.kinds[i]; sync(); S.zoom = 0; rebuild(); },
+  reset() { S.sel = -1; setZoom(0); renderDetail(-1); },
+};
+$("metrics").onclick = e => { const b = e.target.closest("button"); if (b) act.metric(+b.dataset.m); };
+$("modes").onclick = e => { const b = e.target.closest("button"); if (b) act.toggle(b.dataset.k); };
+$("kinds").onclick = e => { const b = e.target.closest("button"); if (b) act.kind(+b.dataset.k); };
+$("proc").onchange = e => { S.proc = +e.target.value; S.zoom = 0; S.sel = -1; rebuild(); controls(); timeline(); };
+$("crumbs").onclick = e => { const b = e.target.closest("button"); if (b) setZoom(+b.dataset.i); };
+$("theme").onclick = () => { S.theme = S.theme === "dark" ? "light" : "dark"; sync(); draw(); timeline(); renderSide(); };
+$("topfn").onclick = e => { const r = e.target.closest("tr"); if (r && r.dataset.n) { $("q").value = r.dataset.n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); runSearch(); draw(); } };
+$("q").oninput = () => { runSearch(); draw(); };
+cv.onmousemove = e => {
+  const r = cv.getBoundingClientRect(), i = hit(e.clientX - r.left, e.clientY - r.top), tip = $("tip");
+  if (i !== S.hover) { S.hover = i; draw(); if (S.sel < 0) renderDetail(i); }
+  if (i < 0) { tip.classList.remove("on"); cv.style.cursor = ""; return; }
+  cv.style.cursor = "pointer";
+  const lab = labelOf(i), tot = W.total[0] || 1;
+  tip.innerHTML = `<div class="n">${esc(lab.name)}${catChip(lab.cat)}</div>${where(lab) ? `<div class="l">${esc(where(lab))}</div>` : ""}
+    <div class="v"><span><b class="num">${human(W.total[i])}</b> total</span><span><b class="num">${pct(W.total[i], tot)}</b></span><span><b class="num">${human(T.self[S.metric][i])}</b> self</span></div>`;
+  const x = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8), y = Math.min(e.clientY + 16, innerHeight - tip.offsetHeight - 8);
+  tip.style.left = x + "px"; tip.style.top = y + "px"; tip.classList.add("on");
+};
+cv.onmouseleave = () => { S.hover = -1; $("tip").classList.remove("on"); draw(); };
+cv.onclick = e => {
+  const r = cv.getBoundingClientRect(), i = hit(e.clientX - r.left, e.clientY - r.top);
+  if (i < 0) return;
+  S.sel = i; renderDetail(i);
+  setZoom(i === S.zoom ? (i > 0 ? T.parent[i] : 0) : i);
+};
+addEventListener("keydown", e => {
+  if (e.target === $("q")) { if (e.key === "Escape") { $("q").value = ""; runSearch(); draw(); $("q").blur(); } return; }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key;
+  if (k === "/") { e.preventDefault(); $("q").focus(); }
+  else if (k === "Escape") act.reset();
+  else if (k >= "1" && k <= "5") act.metric(+k - 1);
+  else if (k === "i") act.toggle("invert");
+  else if (k === "f") act.toggle("flip");
+  else if (k === "s") act.toggle("system");
+  else if (k.startsWith("Arrow")) {  // walk: keyboard actions never animate
+    e.preventDefault();
+    let i = S.sel < 0 ? S.zoom : S.sel;
+    const up = (k === "ArrowUp") !== S.flip;
+    if ((k === "ArrowUp" || k === "ArrowDown") && up) i = i > 0 ? T.parent[i] : 0;
+    else if (k === "ArrowUp" || k === "ArrowDown") i = W.first[i] >= 0 ? W.first[i] : i;
+    else {
+      const p = i > 0 ? T.parent[i] : -1, sib = [];
+      if (p >= 0) for (let c = W.first[p]; c >= 0; c = W.next[c]) sib.push(c);
+      const at = sib.indexOf(i);
+      if (at >= 0) i = sib[Math.max(0, Math.min(sib.length - 1, at + (k === "ArrowRight" ? 1 : -1)))];
+    }
+    S.sel = i; renderDetail(i);
+    const tot = W.total[0] || 1, l = W.x[i] / tot, r = (W.x[i] + W.total[i]) / tot;
+    if (l < S.zx || r > S.zx + S.zw) setZoom(i, true); else draw();
+  }
+});
+let resizing = 0;  // redraw on the next frame: resizing the canvas inside the callback would loop the observer
+new ResizeObserver(() => { cancelAnimationFrame(resizing); resizing = requestAnimationFrame(() => { draw(); timeline(); }); }).observe($("view"));
+
+// ---------- benchmark (tools/flame-shot.sh): a synthetic tree of n nodes, redrawn k times ----------
+window.__ht.bench = (n = 100000, k = 50) => {
+  const names = Array.from({ length: 4000 }, (_, i) => `fn_${i}_${hash("s" + i).toString(36).slice(2, 8)}`);
+  const parent = [-1, 0], frame = [-100, -1], self = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]];
+  let seed = 7; const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  for (let i = 2; i < n; i++) {
+    parent.push(1 + Math.floor(rnd() ** 2.2 * (i - 1))); frame.push(Math.floor(rnd() * names.length));
+    const w = rnd() < .6 ? Math.floor(rnd() ** 3 * 1e6) : 0;
+    for (const s of self) s.push(w);
+  }
+  DATA.push({ pid: 0, exe: "bench", attached: false, totals: [0, 0, 0, 0, 0], names, files: [""],
+    frames: { name: names.map((_, i) => i), file: names.map(() => 0), line: names.map(() => 0), cat: names.map((_, i) => i % 4) },
+    nodes: { parent, frame, self }, samples: { t: [], cpu: [], gpu: [] }, python: [] });
+  S.proc = DATA.length - 1; S.zoom = 0; S.system = false; S.invert = false;
+  const tb = performance.now(); rebuild(); const build_ms = performance.now() - tb;
+  const t0 = performance.now(); let worst = 0;
+  for (let j = 0; j < k; j++) { S.zx = (j % 10) / 40; S.zw = 1 - S.zx; draw(); worst = Math.max(worst, stats.ms); }
+  return { nodes: T.n, drawn: stats.drawn, build_ms, avg_ms: (performance.now() - t0) / k, worst_ms: worst };
+};
+
+// ---------- self-check (tools/flame-shot.sh): what a reader would see, measured in the page ----------
+window.__ht.check = (name) => {
+  const total = W.total[0], r = { errors: window.__errs, nodes: T.n, drawn: stats.drawn, total, metric: METRICS[S.metric][0] };
+  if (name) { $("q").value = name; runSearch(); draw(); r.search_bytes = matchBytes; r.search_hits = matched.reduce((a, v) => a + v, 0); $("q").value = ""; runSearch(); }
+  act.toggle("invert"); r.inverted_total = W.total[0]; act.toggle("invert");
+  const pick = drawn.find(i => i > 0 && W.total[i] < total);
+  if (pick !== undefined) { setZoom(pick, true); r.zoom_drawn = stats.drawn; setZoom(0, true); }
+  r.redraw_ms = stats.ms;
+  return r;
+};
+
+// ---------- start: the process with the most nodes, the first metric that holds bytes ----------
+S.proc = DATA.reduce((b, p, i) => p.nodes.parent.length > DATA[b].nodes.parent.length ? i : b, 0);
+S.metric = /[?&]m=[0-4]/.test(location.search) ? +location.search.match(/[?&]m=([0-4])/)[1] : Math.max(0, DATA[S.proc].totals.findIndex(v => v > 0));
+S.system = userShare(buildBase(DATA[S.proc]), S.metric) >= .5;
+rebuild(); controls(); timeline(); renderDetail(-1);
+</script>
+</body>
+</html>

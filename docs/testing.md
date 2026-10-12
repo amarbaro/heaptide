@@ -1,16 +1,18 @@
 # Testing
 
-`tests/run.sh` builds everything and runs 165 checks against programs with planted bugs. Where a
+`tests/run.sh` builds everything and runs 187 checks against programs with planted bugs. Where a
 standard tool can answer the same question, its answer is the oracle: heaptrack for leaked
 allocation counts, LeakSanitizer (`clang -fsanitize=leak`) for the direct/indirect split and
 reachability. The script prints `PASS N/N`, or `FAIL k/N <names>` and exits non-zero.
 
 ```
-tests/run.sh                    # everything, GPU included: PASS 165/165
-tests/run.sh --cpu              # CPU checks only: PASS 160/160 (cpu only: GPU checks not run)
+tests/run.sh                    # everything, GPU included: PASS 187/187
+tests/run.sh --cpu              # CPU checks only: PASS 182/182 (cpu only: GPU checks not run)
 HEAPTIDE_NO_GPU=1 tests/run.sh  # GPU checks skipped and counted as FAIL
 taskset -c 0 tests/run.sh --cpu # one CPU: the signal and snapshot checks poll, never sleep-guess
 tools/ci-local.sh               # .github/workflows/cpu.yml's steps in ubuntu:24.04, on HEAD: run before a push
+bash tools/skylake-check.sh     # as root on an old CPU without llvm-symbolizer, next to the release tarball and src.tgz
+tools/flame-shot.sh DIR [FRAME] # a flame page in headless Chromium: screenshots, no script error, search, inverted total, zoom
 GPU_ARCH=gfx90a tests/run.sh    # override the GPU target (default: first gfx* from rocminfo)
 ```
 
@@ -50,13 +52,18 @@ older CPU (it caught a report built for the build machine's CPU) and under WSL2 
 | `c_edge.c` | `realloc(p, 0)` (small and mmap-backed), `reallocarray` overflow, `dlsym("hipMalloc")` without HIP, 1 of 2 blocks lost, a reservation's middle page moved and grown, `mremap` over another mapping, a thread's pending updates at the peak, `ulimit -v 1G`, a path with a space | direct 0 / 0, errno 12, NULL, 1 leaked block, live_mmap 8192 / 8192, worker's 258048 B in PEAK, exit 0 with direct 64, source line shown |
 | `hip_mock.c` | fake `libamdhip64` whose `hipFree` fails | the block stays live (live_gpu 4096) |
 | report inputs | truncated `.bin`, impossible counts, `--top` without value, unknown flag, negative `--growth-limit`, a module path with `\\` and `"` | exit 2 each; `--json` parses |
-| `c_snapshot.c` | loses 1 KiB every 50 ms for 2 s | `heaptide snapshot` at 1 s: 0 < direct < 40960; final 40960; the snapshot's block count = direct / 1024 (batched counters flushed); `--snapshot-every` writes >= 2; with `prlimit --nproc=1` (no fork) the in-place snapshot still works and final stays 40960 |
+| `c_snapshot.c` | loses 1 KiB every 50 ms for 2 s | `heaptide snapshot` at 1 s exits 0 and the report is read at once (no wait): 0 < direct < 40960; final 40960; the snapshot's block count = direct / 1024 (batched counters flushed); `--snapshot-every` writes >= 2; with `prlimit --nproc=1` (no fork) the in-place snapshot still works and final stays 40960 |
 | `c_rtsig.c` | installs its own `SIGRTMAX-2` handler, one idle thread, prints `held`, raises the signal after 3 s | a snapshot in between leaves the program's handler in place (exit 0) and is not skipped |
 | `c_sleep.c` | holds 1 MiB from `keep()` in a local, sleeps 2 s, exits 1 if the sleep was cut short | a snapshot during the sleep leaves it intact (exit 0; the v0.1.3 shim: exit 1) and shows `held by: a thread's stack` |
 | `hip_tl.c` | mock `libamdhip64` (each allocation keeps 1 MiB more on the device); a site grows 4, 8, 12 MiB 300 ms apart, two streams, one freed | `--gpu-timeline all`: the three steps, two `[stream` rows, the device line ends at 7 MiB; `sites` alone has no stream or device row; off: no section; a bad part exits 2. On the GPU, `hip_leak` with `all` shows the section |
 | `c_diff.c` | base: 10 x 1000 B lost at `lose_a`, a 1 MiB peak at `buffer`; `-DEXTRA`: also 10 x 500 B at `lose_b`, a 4 MiB peak, `lose_a` one line lower | `heaptide diff`: NEW `lose_b`, GROWN `buffer` 1.0 -> 4.0 MiB, `lose_a` not listed, exit 1; a run against itself prints nothing, exit 0; `--fail-on none` exit 0; `--json` groups |
-| `c_attach.c` | started without heaptide, allows ptrace (`PR_SET_PTRACER_ANY`); once attached: 20 x 256 B into a table reachable only through a block from before attach, 20 x 1000 B lost at `lose_after` | `heaptide attach` exits 0, the program exits 0; leaks at `lose_after`, the table entries `held by: memory from before attach` and not in LEAKS (without the pre-attach roots: 24120 B direct); attach to a process that does not allow ptrace: exit 2 with the Yama hint; built `-z relro,-z now`: the page holding `malloc`'s GOT slot is `r--p` again after attach |
+| `c_attach.c` | started without heaptide, allows ptrace (`PR_SET_PTRACER_ANY`); once attached: 20 x 256 B into a table reachable only through a block from before attach, 20 x 1000 B lost at `lose_after` | `heaptide attach` exits 0, the program exits 0; leaks at `lose_after`; `GROWTH  n/a (attached` and JSON `"growth":"attached"`, the table entries `held by: memory from before attach` and not in LEAKS (without the pre-attach roots: 24120 B direct); attach to a process that does not allow ptrace: exit 2 with the Yama hint; built `-z relro,-z now`: the page holding `malloc`'s GOT slot is `r--p` again after attach |
+| `c_detach.c` | started without heaptide; once its own `malloc` GOT slot is heaptide's: 20 x 1000 B lost at `lose_before`; once the slot holds libc's `malloc` again: 20 x 1000 B lost at `lose_after`. Built `-z relro,-z now` | `heaptide detach` exits 0, the program exits 0 (it saw its slot return to libc); the GOT page is `r--p` after detach; `lose_before` in LEAKS, `lose_after` nowhere; no report at its exit |
+| `c_ownmalloc.c` | exports its own `malloc`/`free` (tagged header over libc; `free` aborts on an untagged block), as Chromium and jemalloc builds do; 200 blocks from before attach freed after it, 200 `strdup` calls after it | attached, the program exits 0 (before the fix: `BAD FREE`, abort); `strdup` sites reported |
+| `c_ownlock.c` | exports malloc/free under one error-checking lock and maps large blocks with `mmap` + `madvise` while holding it (as PartitionAlloc does); 64 TLS keys; threads started after heaptide arrives | attached and under `run`, the program exits 0 (before the fix: exit 7, malloc re-entered under its own lock: a thread's first unwind allocated through it) |
+| `demo.c` (flame) | the demo's report as `--folded` and as `heaptide flame` | folded leaked bytes = 19,200 and live = 19,328, the shim's own totals; the page holds its data; `tests/flame_check.mjs` runs the page's tree code in node: all four views (normal, inverted, system hidden, both) keep every metric's total, the root's children are kinds, `handle_request` is a frame. The same on `py_mixed` with `py::leak_in_native` |
 | `py_mixed.py`, `py_gpu.py` | Python functions that lose a `ctypes` `malloc` (10 x 4 KiB) and a `hipMalloc` (1 MiB, mock library loaded `RTLD_LOCAL`) | under `--py`: the native and the GPU site end in `py::leak_in_native py_mixed.py` / `py::load_weights py_gpu.py`; the GPU block is tracked (1 MiB) |
+| `qml_hold.qml` | Qt 6 QML (`qml6 -a core`): 2000 strings held by a JavaScript array for 3 s | a snapshot each second: direct < 4 KiB (192 B; without memfd roots 968,572 B false leaks); runs where `qml6` is installed |
 | `c_remap.c` | a reservation grown and moved with `mremap`, then committed | live mmap 2097152, direct 1048576 |
 | generated `c20.c` | 20 leaking sites under a shim with a 4-bit stack hash | same site count as the normal shim (19; 8 without the check hash) |
 | `c_fork.c` | parent and child each lose a block; the child links a block only from a parent block | child direct 32, parent direct 64 (LSan reports 96 in the child: deliberate) |
@@ -64,7 +71,7 @@ older CPU (it caught a report built for the build machine's CPU) and under WSL2 
 | `c_forkmt.c` | 8 threads swap blocks in shared slots while main forks 200 times; each child leaks 200000 B at `lose_child` (a fresh mapping: a 40 B chunk could reuse an address a dead worker still held) and frees every slot | every child reports exactly 200000 B direct; no site with negative peak bytes |
 | `c_cache.c` | global `g_cache` -> table (`make_table`, or `alt_table` with an argument) -> 2000 x 4 KiB entries, nothing freed | no leak; PEAK `add_entry` held by `make_table c_cache.c:7 << global g_cache` (text and `--json` "held"); with the argument the chain names `alt_table` |
 | `mojo_heap.mojo` | Mojo: 1000 x Int (8000 B) from `alloc` in `lose()`, never freed (only a scrambled copy of its address escapes) | 8000 B direct at `mojo_heap::lose`; no tcmalloc arena mapped (`live_mmap` 0); the previous shim saw 0 B |
-| `py_leak.py` | Python objects and numpy buffers kept alive | PYTHON lines 6 and 7; numpy's native frames; output file < 8 MB |
+| `py_leak.py` | Python objects and numpy buffers kept alive | PYTHON lines 6 and 7, one row each (two bytecode offsets on line 6 merge); line 7 holds >= 4,096,000 B (numpy's data, via `PyTraceMalloc_Track`); numpy's native frames; output file < 8 MB |
 | `py_hold.py` | holds 8 MiB at line 2, prints `held` (tests wait on it, not on the SIGTERM handler), sleeps | `heaptide snapshot`: PYTHON section written while running; SIGTERM: exit 143 and `py_hold.py:2`; SIGTERM during startup: exit 143 and a PYTHON section |
 | `self.supp` | suppresses `libAsyncRTRuntimeGlobals.so` (Mojo runtime pool, 2 MiB on large dumps) | `self`: heaptide on its own `heaptide_report` (reporting `demo`), `--fail-on leaks` exits 0 |
 | `py_deep.py` | a leak two Python calls deep, `--py-depth 2` | PYTHON site `py_deep.py:4 <- py_deep.py:6` |

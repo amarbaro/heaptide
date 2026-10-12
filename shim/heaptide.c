@@ -229,7 +229,19 @@ static void peak_check(int force) {
   atomic_flag_clear(&peak_lk);
 }
 
+// libunwind keeps thread-local state. Loaded at attach (after the program started), its block is
+// allocated on a thread's first unwind by the dynamic loader, with the program's own malloc: inside
+// an mmap-family hook that may run under the program's allocator lock (PartitionAlloc maps memory
+// holding it), a self-deadlock. So such a hook unwinds only on a thread whose block exists already
+// (dlinfo reads it without allocating); a malloc-family hook, outside the allocator, creates it.
+static void *unw_h;  // libunwind, when its TLS is dynamic (a module with TLS)
+static TLS int unw_ok;
+static int unw_ready(void) {
+  void *t = 0;
+  return unw_ok || !unw_h || (unw_ok = !dlinfo(unw_h, RTLD_DI_TLS_DATA, &t) && t);
+}
 __attribute__((always_inline)) static inline uint32_t stack_id(int kind) {  // inlined: one less frame to unwind
+  if (kind == MMAP && !unw_ready()) return 0;
   void *buf[DEPTH + 4], **ips = buf;
   int d = unw_backtrace(buf, depth + 4);
   while (d && (uintptr_t)*ips - self_lo < self_n) ips++, d--;  // our own frames
@@ -317,9 +329,10 @@ static void *boot_alloc(size_t n) {
   void *p = boot + boot_used; boot_used += n; return p;
 }
 
+static void *scope = RTLD_NEXT;  // attached: RTLD_DEFAULT (see attach)
 static void *next(const char *name) {
   if (!r_dlsym) r_dlsym = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
-  return r_dlsym(RTLD_NEXT, name);
+  return r_dlsym(scope, name);
 }
 
 // Other libraries' constructors can allocate before ours runs: resolve on first use, and serve
@@ -496,7 +509,10 @@ HOOK int hipFreeAsync(void *p, void *s) { REAL((void *, void *), "hipFreeAsync")
 static int same(const char *a, const char *b) { while (*a && *a == *b) a++, b++; return *a == *b; }
 // dlsym can be asked before this library's ifunc slots are bound (ASan's init, run by the loader):
 // no libc string call on this path
+static int py_on;
+static void py_patch(void);
 HOOK void *dlsym(void *h, const char *name) {
+  if (py_on && !strncmp(name, "PyInit_", 7)) py_patch();  // an extension just loaded, not yet run
   static const struct { const char *n; void *f; } ours[] = {
       {"hipMalloc", hipMalloc}, {"hipMallocAsync", hipMallocAsync}, {"hipHostMalloc", hipHostMalloc},
       {"hipFree", hipFree},     {"hipHostFree", hipHostFree},       {"hipFreeAsync", hipFreeAsync}};
@@ -514,6 +530,7 @@ HOOK void *dlsym(void *h, const char *name) {
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000ULL + t.tv_nsec; }
 static void report(int final);
+static void py_dump(pid_t pid);
 static char outdir[4096] = ".";
 static uint64_t snap_ns;  // --snapshot-every
 static volatile sig_atomic_t got_sig, py_wait, py_pending;
@@ -564,15 +581,18 @@ static void sample(void) {
   nsamples = i + 1;
   if (tl) timeline(i);
 }
+static void detach(void);
 static void *sampler(void *a) {
   (void)a;
   guard = 1;
   struct timespec d = {every_ms / 1000, (long)(every_ms % 1000) * 1000000};
-  char trig[4200];
+  char trig[4200], dtrig[4200];
   snprintf(trig, sizeof trig, "%s/snapshot", outdir);
+  snprintf(dtrig, sizeof dtrig, "%s/detach", outdir);
   for (uint64_t next = now_ns() + snap_ns; !stop;) {
     sample();
     if (got_sig) { int sig = got_sig; report(1); signal(sig, SIG_DFL); raise(sig); }
+    if (!access(dtrig, F_OK)) { detach(); unlink(dtrig); return 0; }  // gone: heaptide detach returns
     if (child > 0 && syscall(SYS_wait4, child, 0, WNOHANG | __WCLONE, 0) == child) child = 0;
     if (child <= 0 && ((snap_ns && now_ns() >= next) || !unlink(trig))) report(0), next = now_ns() + snap_ns;
     nanosleep(&d, 0);
@@ -697,6 +717,12 @@ static const char *hooked[] = {"malloc", "calloc", "free", "realloc", "reallocar
 static void *own[sizeof hooked / sizeof *hooked];
 static uint64_t (*pre)[2];  // writable anonymous memory at attach: may hold the only pointer to a new block
 static int npre;
+enum { MAXGOT = 16384 };
+static uint64_t (*got)[2];  // each slot attach wrote and its old value: detach writes it back
+static int ngot, undo, attached;
+static const char *const *pnames = hooked;  // what patch_cb points at ours: attach's list, or py_patch's
+static void **pown = own;
+static size_t npatch = sizeof hooked / sizeof *hooked;
 static int patch_cb(struct dl_phdr_info *in, size_t sz, void *self) {
   (void)sz;
   const ElfW(Dyn) *d = 0;
@@ -721,11 +747,16 @@ static int patch_cb(struct dl_phdr_info *in, size_t sz, void *self) {
       uint32_t t = ELF64_R_TYPE(rel[k][j].r_info);
       if (t != R_X86_64_JUMP_SLOT && t != R_X86_64_GLOB_DAT) continue;
       const char *name = str + sym[ELF64_R_SYM(rel[k][j].r_info)].st_name;
-      for (size_t h = 0; h < sizeof hooked / sizeof *hooked; h++)
-        if (own[h] && !strcmp(name, hooked[h])) {
+      for (size_t h = 0; h < npatch; h++)
+        if (pown[h] && !strcmp(name, pnames[h])) {
           void **slot = (void **)(in->dlpi_addr + rel[k][j].r_offset);
+          int g = 0;  // detach: only a slot still ours, in an object still loaded (one dlclosed since is unmapped)
+          while (undo && g < ngot && got[g][0] != (uintptr_t)slot) g++;
+          if (undo && (g == ngot || *slot != pown[h])) continue;
           mprotect((void *)((uintptr_t)slot & ~4095UL), 4096, PROT_READ | PROT_WRITE);
-          *slot = own[h];
+          if (undo) { *slot = (void *)got[g][1]; continue; }
+          if (got && ngot < MAXGOT) got[ngot][0] = (uintptr_t)slot, got[ngot++][1] = (uintptr_t)*slot;
+          *slot = pown[h];
         }
     }
   if (ro_n) mprotect((void *)(ro & ~4095UL), (ro + ro_n + 4095) / 4096 * 4096 - (ro & ~4095UL), PROT_READ);
@@ -735,12 +766,17 @@ static ssize_t slurp(const char *path, char *buf, size_t n);
 static void unvm(void *p, size_t n);
 static void attach(void) {
   Dl_info me; dladdr((void *)attach, &me);
+  attached = 1;
   void *h = dlopen(me.dli_fname, RTLD_NOW | RTLD_NOLOAD);
   for (size_t i = 0; h && i < sizeof hooked / sizeof *hooked; i++) own[i] = r_dlsym(h, hooked[i]);
+  // Forward to what the dynamic linker bound, which may be the program's own allocator (Chromium's
+  // PartitionAlloc, a jemalloc or tcmalloc build export malloc): RTLD_NEXT from a library loaded
+  // RTLD_LOCAL finds libc's, and a block allocated before attach then reached libc's free (abort).
+  scope = RTLD_DEFAULT; r_malloc = 0; resolve();
   char *maps = vm(1 << 20);  // only when attached: a static buffer cost every program 2 MB resident
   if (!maps) return;
   slurp("/proc/self/maps", maps, 1 << 20);
-  pre = vm(4096 * 16);
+  pre = vm(4096 * 16); got = vm(MAXGOT * 16);
   for (char *l = maps; pre && *l && npre < 4096; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : "") {
     char *q, *nl = strchr(l, '\n');
     uint64_t a = strtoull(l, &q, 16), e = strtoull(q + 1, &q, 16);
@@ -750,13 +786,13 @@ static void attach(void) {
   unvm(maps, 1 << 20);
   dl_iterate_phdr(patch_cb, me.dli_fbase);
 }
-// Memory from before attach is a root, but not the blocks tracked inside it: those are scanned only
+// Memory from before attach (and memfd heaps) is a root, but not the blocks tracked inside it: those are scanned only
 // when reached, so a lost block still shows (a stale pointer in a freed chunk can hide one: an
 // attached report can under-report, never over-report).
-static void scan_pre(void) {
-  cur = 1ULL << 61;
-  for (int r = 0; r < npre; r++) {
-    uint64_t at = pre[r][0], e = pre[r][1];
+static void scan_ranges(uint64_t (*rg)[2], int nr, uint64_t root) {
+  cur = root;
+  for (int r = 0; r < nr; r++) {
+    uint64_t at = rg[r][0], e = rg[r][1];
     size_t lo = 0, hi = nstarts;  // first block starting at or after the range, minus one (it may overlap)
     while (lo < hi) { size_t m = (lo + hi) / 2; if (starts[m].k < at) lo = m + 1; else hi = m; }
     for (size_t i = lo ? lo - 1 : 0; i < nstarts && at < e; i++) {
@@ -818,8 +854,10 @@ static int park_sig(void) {
 // 1 when every other thread is parked or, for a snapshot, asleep in a system call: a signal would
 // end that sleep early (nanosleep, poll, epoll_wait return EINTR), so such a thread is read from
 // /proc instead (stack pointer only: its saved registers are not scanned)
+static int sent, asleep;  // the last stop_threads: signalled, and asleep in a system call (read from /proc)
 static int stop_threads(int snap) {
-  int sig = park_sig(), sent = 0, asleep = 0;
+  int sig = park_sig();
+  sent = asleep = 0;
   nthr = 0; parked = 0; released = 0;  // no free signal: threads listed, none parked (as if blocked)
   if (!thr) thr = vm(MAXTHR * sizeof(thr_t));  // kept: a late park signal still reads it
   DIR *d = opendir("/proc/self/task");
@@ -900,7 +938,7 @@ static void report(int final) {
   int all_parked = stop_threads(!final);
   if (!final && !all_parked) {
     released = 1; unvm(segs, 4096 * 16);
-    dprintf(2, "heaptide: snapshot skipped: %d of %d threads parked\n", (int)parked, nthr);
+    dprintf(2, "heaptide: snapshot skipped: %d of %d threads parked (%d asleep, %d signalled, park signal %d)\n", (int)parked, nthr, asleep, sent, park_sig());
     guard = g; atomic_flag_clear(&reporting); return;
   }
   // A snapshot scans a copy-on-write fork, so the program pauses only for the fork, not the scan.
@@ -956,7 +994,25 @@ static void report(int final) {
   for (size_t i = 0; i < nstarts; i += RUN) top[i / RUN] = starts[i].k;
   for (size_t i = 0; i < ntop; i += RUN) top2[i / RUN] = top[i];
   for (int i = 0; i < nsegs; i++) scan((char *)segs[i][0], (char *)segs[i][1], REACH), flood(REACH);
-  if (npre) scan_pre();
+  if (npre) scan_ranges(pre, npre, 1ULL << 61);
+  // Private writable memfd mappings are anonymous memory with a name: Qt's JavaScript engine keeps its
+  // GC heap there (JSGCHeap, JSVMStack), other VMs and JITs do the same. Never tracked as blocks (they
+  // are file-backed), so they are roots: else everything a script holds would look lost.
+  {  // mapped for this scan only: static buffers stayed resident in every program (+2 MB peak)
+    char *mp = vm(1 << 20);
+    uint64_t (*mf)[2] = vm(4096 * 16);
+    int nmf = 0;
+    if (mp && mf) {
+      slurp("/proc/self/maps", mp, 1 << 20);
+      for (char *l = mp; *l && nmf < 4096; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : "") {
+        char *q, *nl = strchr(l, '\n');  // the name searched in this line only (strstr ran to the end: quadratic)
+        uint64_t a = strtoull(l, &q, 16), e = strtoull(q + 1, &q, 16);
+        if (q[1] == 'r' && q[2] == 'w' && q[4] == 'p' && memmem(l, nl ? (size_t)(nl - l) : strlen(l), " /memfd:", 8)) mf[nmf][0] = a, mf[nmf++][1] = e;
+      }
+      if (nmf) scan_ranges(mf, nmf, 1ULL << 60);
+    }
+    unvm(mp, 1 << 20); unvm(mf, 4096 * 16);
+  }
   // LSan's use_ld_allocations: a block with a linker frame is a root (a thread's DTV is held as
   // dtv + 1 in its TCB); blocks inherited over fork are roots too (see forked)
   for (size_t i = 0; i < na; i++) {
@@ -984,13 +1040,14 @@ static void report(int final) {
     for (size_t i = 0; i < na; i++) all[i]->v = (all[i]->v & ~(uint64_t)(REACH | INDIRECT)) | (was[i] ? REACH : 0);
   released = 1;
 
+  if (!final) py_dump(pid);  // --py: the PYTHON section of this snapshot, in place before the .bin
   // one file, written as .tmp and renamed: a reader never sees half a report, nor maps from another snapshot
   char path[4200], tmp[4210];
   snprintf(path, sizeof path, "%s/heaptide.%d.bin", outdir, pid);
   snprintf(tmp, sizeof tmp, "%s.tmp", path);
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
-    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms, 7 | (tl ? 8 : 0) /* leaked block counts, retention, timeline, then maps text */, 0};
+    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms, 7 | (tl ? 8 : 0) | (attached ? 16 : 0) /* leaked block counts, retention, timeline, then maps text; attached */, 0};
     wr(fd, hdr, sizeof hdr);
     wr(fd, ips_arena, ips_used * 8);
     wr(fd, rows + 1, n * sizeof(row_t));
@@ -1027,6 +1084,195 @@ nomem:  // out of memory or address space: say so rather than write a report mis
   guard = g;
   atomic_flag_clear(&reporting);
 }
+// heaptide detach (OUT/detach, seen by the sampler): the hooks pass through from here on (the flags a
+// final report sets, so no report at exit either), attach's GOT slots get their old values back and
+// our signal handlers go. The library stays loaded: code may still hold &free from while attached.
+static void drop(void *p, size_t n) { if (p) syscall(SYS_madvise, p, n, MADV_DONTNEED); }
+static void detach(void) {
+  struct timespec ms = {0, 1000000};
+  while (atomic_flag_test_and_set(&reporting)) nanosleep(&ms, 0);
+  done = 1, ready = 0, stop = 1;
+  atomic_flag_clear(&reporting);
+  if (child > 0) syscall(SYS_wait4, child, 0, __WCLONE, 0), child = 0;
+  Dl_info me; dladdr((void *)detach, &me);
+  undo = 1; dl_iterate_phdr(patch_cb, me.dli_fbase);
+  struct sigaction sa;
+  for (int s = 1; s < 32; s++)
+    if (!sigaction(s, 0, &sa) && (sa.sa_handler == on_term || sa.sa_sigaction == on_crash)) signal(s, SIG_DFL);
+  // The tables go back to the kernel but stay mapped (they read as zeros): a thread that was inside a
+  // hook when the flags flipped finishes on empty tables rather than faulting.
+  for (int i = 0; i < SHARDS * 2; i++) {
+    tab_t *t = i < SHARDS ? &live[i] : &stacks[i - SHARDS];
+    lock(&t->lk); drop(t->t, t->cap * sizeof(ent_t)); t->n = 0; unlock(&t->lk);
+  }
+  drop(rows, (size_t)maxstacks * sizeof(row_t)); drop(ips_arena, ips_cap * 8); drop(samples, (size_t)MAXSAMPLES * 24);
+  drop(tl, (size_t)MAXSAMPLES * 16); drop(mm, sizeof(map_t) << 20); drop(rs, sizeof(map_t) << 20); drop(dn, sizeof(map_t) << 20);
+}
+// --py, memray's design aggregated here: Python's PyMem and object allocators are wrapped
+// (PyMem_SetAllocator; both run with the GIL held) and each block is charged to a Python site, the
+// (code object, instruction offset) of its innermost --py-depth frames, hashed and cached. A new
+// site is named "file:line <- file:line" once; its code objects are kept alive, since a freed one's
+// address could come back as another's. Nothing is allocated per block, unlike tracemalloc (whose
+// own bookkeeping the native hooks then tracked too: 30 s and 3.9 GB on bench/py_bench.py).
+typedef struct { void *ctx; void *(*malloc)(void *, size_t); void *(*calloc)(void *, size_t, size_t);
+                 void *(*realloc)(void *, void *, size_t); void (*free)(void *, void *); } pyalloc_t;
+enum { MAXPY = 1 << 16, PYCACHE = 4096, PYNAMES = 64 << 20 };
+typedef struct { int64_t bytes, blocks; uint32_t name, hide; } pyrow_t;
+static pyalloc_t py_orig[2], py_mine[2];  // PYMEM_DOMAIN_MEM, PYMEM_DOMAIN_OBJ
+static tab_t py_live, py_sites, py_byname;  // block -> size << SIZE_SHIFT | site; site hash -> site; name hash -> site
+static pyrow_t *py_rows;
+static uint32_t py_n = 1;  // site 0: no Python frame
+static char *py_names, py_self[4096];
+static size_t py_names_used;
+static uint64_t py_cache[PYCACHE][2];  // site hash, site
+static void *py_codes[MAXPY];  // static: the leak scan sees them held
+static int py_depth = 1, py_ncodes, py_lasti;
+static TLS int py_in;  // inside our own Python calls, which allocate
+static struct {
+  void *(*frame)(void), *(*code)(void *), *(*back)(void *), *(*getattr)(void *, const char *);
+  int (*at)(void *), (*line)(void *, int), (*gil)(void);
+  void (*ungil)(int);
+  const char *(*utf8)(void *);
+  void (*incref)(void *), (*decref)(void *);
+} P;
+static uint32_t py_name(uint64_t h, void **c, int *at, int d) {  // two offsets on one line are one site
+  if (py_n >= MAXPY) return 0;
+  uint32_t s = py_n, o = py_names_used, hide = 0;
+  for (int i = 0; i < d; i++) {
+    void *f = P.getattr(c[i], "co_filename");
+    const char *file = f ? P.utf8(f) : 0;
+    if (!file) file = "?";
+    if (!i) hide = !strcmp(file, py_self) || strstr(file, "/runpy.py") || !strncmp(file, "<frozen ", 8);
+    int n = snprintf(py_names + o, PYNAMES - o, "%s%s:%d", i ? " <- " : "", file, py_lasti ? P.line(c[i], at[i]) : at[i]);
+    o = n > 0 && o + n < PYNAMES ? o + n : o;
+    if (f) P.decref(f);
+    if (py_ncodes < MAXPY) P.incref(c[i]), py_codes[py_ncodes++] = c[i];
+  }
+  py_names[o] = 0;
+  uint64_t hn = 1;
+  for (uint32_t i = py_names_used; i < o; i++) hn = mix(hn + (uint8_t)py_names[i]);
+  ent_t *x = py_byname.t ? slot(&py_byname, hn) : 0;
+  if (x && x->k == hn) s = x->v;
+  else py_rows[s] = (pyrow_t){.name = py_names_used, .hide = hide}, py_n++, put(&py_byname, hn, s), py_names_used = o + 1 < PYNAMES ? o + 1 : o;
+  put(&py_sites, h, s);
+  return s;
+}
+static uint32_t py_site(void) {
+  void *f = P.frame(), *c[8];  // the innermost frame is borrowed, the ones behind it are new references
+  int at[8], d = 0;
+  uint64_t h = 0;
+  while (f && d < py_depth) {
+    c[d] = P.code(f); at[d] = P.at(f);
+    h = mix(h + (uint64_t)c[d] + ((uint64_t)(uint32_t)at[d] << 40));
+    void *b = ++d < py_depth ? P.back(f) : 0;
+    if (d > 1) P.decref(f);
+    f = b;
+  }
+  if (!d) return 0;
+  h |= 1;
+  uint64_t *e = py_cache[h & (PYCACHE - 1)];
+  if (e[0] != h) {
+    ent_t *x = py_sites.t ? slot(&py_sites, h) : 0;
+    e[0] = h; e[1] = x && x->k == h ? x->v : py_name(h, c, at, d);
+  }
+  for (int i = 0; i < d; i++) P.decref(c[i]);
+  return e[1];
+}
+static void py_track(void *p, size_t n) {
+  if (!p || py_in || !ready) return;
+  py_in = 1;
+  int err = errno;
+  uint32_t s = py_site();
+  put(&py_live, (uint64_t)p, (uint64_t)n << SIZE_SHIFT | s);
+  py_rows[s].bytes += n; py_rows[s].blocks++;
+  errno = err;
+  py_in = 0;
+}
+static void py_untrack(void *p) {
+  uint64_t v;
+  if (p && py_live.t && del(&py_live, (uint64_t)p, &v)) py_rows[v & (REACH - 1)].bytes -= v >> SIZE_SHIFT, py_rows[v & (REACH - 1)].blocks--;
+}
+static void *py_malloc(void *c, size_t n) { pyalloc_t *o = c; void *p = o->malloc(o->ctx, n); py_track(p, n); return p; }
+static void *py_calloc(void *c, size_t k, size_t n) { pyalloc_t *o = c; void *p = o->calloc(o->ctx, k, n); py_track(p, k * n); return p; }
+static void *py_realloc(void *c, void *p, size_t n) {
+  pyalloc_t *o = c; void *q = o->realloc(o->ctx, p, n);
+  if (q) py_untrack(p), py_track(q, n);
+  return q;
+}
+static void py_free(void *c, void *p) { pyalloc_t *o = c; py_untrack(p); o->free(o->ctx, p); }
+// Extensions report buffers they allocate themselves (numpy's array data) to tracemalloc through
+// this pair, which may be called without the GIL: it is taken, as tracemalloc does.
+HOOK int PyTraceMalloc_Track(unsigned int dom, uintptr_t p, size_t n) {
+  static int (*real)(unsigned int, uintptr_t, size_t);
+  if (!real) real = next("PyTraceMalloc_Track");
+  if (py_on) { int g = P.gil(); py_untrack((void *)p); py_track((void *)p, n); P.ungil(g); }
+  return real ? real(dom, p, n) : 0;
+}
+HOOK int PyTraceMalloc_Untrack(unsigned int dom, uintptr_t p) {
+  static int (*real)(unsigned int, uintptr_t);
+  if (!real) real = next("PyTraceMalloc_Untrack");
+  if (py_on) py_untrack((void *)p);
+  return real ? real(dom, p) : 0;
+}
+// The runner calls this with the GIL held (ctypes.PyDLL), before the script runs; self = its own path.
+HOOK int heaptide_py_start(const char *self) {
+  void (*get)(int, pyalloc_t *) = r_dlsym(RTLD_DEFAULT, "PyMem_GetAllocator"), (*set)(int, pyalloc_t *) = r_dlsym(RTLD_DEFAULT, "PyMem_SetAllocator");
+  P.frame = r_dlsym(RTLD_DEFAULT, "PyEval_GetFrame"); P.code = r_dlsym(RTLD_DEFAULT, "PyFrame_GetCode");
+  P.back = r_dlsym(RTLD_DEFAULT, "PyFrame_GetBack"); P.getattr = r_dlsym(RTLD_DEFAULT, "PyObject_GetAttrString");
+  P.line = r_dlsym(RTLD_DEFAULT, "PyCode_Addr2Line"); P.utf8 = r_dlsym(RTLD_DEFAULT, "PyUnicode_AsUTF8");
+  P.incref = r_dlsym(RTLD_DEFAULT, "Py_IncRef"); P.decref = r_dlsym(RTLD_DEFAULT, "Py_DecRef");
+  P.gil = r_dlsym(RTLD_DEFAULT, "PyGILState_Ensure"); P.ungil = r_dlsym(RTLD_DEFAULT, "PyGILState_Release");
+  py_lasti = !!(P.at = r_dlsym(RTLD_DEFAULT, "PyFrame_GetLasti"));  // 3.11+; before, the line itself is the key
+  if (!py_lasti) P.at = r_dlsym(RTLD_DEFAULT, "PyFrame_GetLineNumber");
+  if (!get || !set || !P.frame || !P.code || !P.back || !P.getattr || !P.line || !P.utf8 || !P.incref || !P.decref || !P.at || !P.gil || !P.ungil) return 1;
+  if (!(py_rows = vm(MAXPY * sizeof(pyrow_t))) || !(py_names = vm(PYNAMES))) return 1;
+  char *e = getenv("HEAPTIDE_PY_DEPTH");
+  py_depth = e && atoi(e) > 0 ? (atoi(e) < 8 ? atoi(e) : 8) : 1;
+  snprintf(py_self, sizeof py_self, "%s", self);
+  py_rows[0].hide = 1;
+  for (int i = 0; i < 2; i++) {
+    get(i + 1, &py_orig[i]);
+    py_mine[i] = (pyalloc_t){&py_orig[i], py_malloc, py_calloc, py_realloc, py_free};
+    set(i + 1, &py_mine[i]);
+  }
+  py_on = 1;
+  return 0;
+}
+// py.<pid>.txt: the 20 Python sites holding the most, as the report prints them. The runner writes it
+// at exit (before finalization frees everything) and on a stop signal; a snapshot's fork writes it too.
+static void py_dump(pid_t pid) {
+  if (!py_on) return;
+  uint32_t top[20]; int nt = 0;
+  for (uint32_t s = 1; s < py_n; s++) {
+    if (py_rows[s].hide || py_rows[s].bytes <= 0) continue;
+    int i = nt < 20 ? nt++ : 20;
+    for (; i > 0 && py_rows[top[i - 1]].bytes < py_rows[s].bytes; i--) if (i < 20) top[i] = top[i - 1];
+    if (i < 20) top[i] = s;
+  }
+  char path[4200], tmp[4210];
+  snprintf(path, sizeof path, "%s/py.%d.txt", outdir, pid);
+  snprintf(tmp, sizeof tmp, "%s.tmp", path);
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return;
+  for (int i = 0; i < nt; i++)
+    dprintf(fd, "  %ld B in %ld blocks  %s\n", (long)py_rows[top[i]].bytes, (long)py_rows[top[i]].blocks, py_names + py_rows[top[i]].name);
+  close(fd);
+  rename(tmp, path);
+}
+HOOK void heaptide_py_dump(void) { py_dump(getpid()); }
+// A python with libpython linked into the executable (Debian, Ubuntu) defines PyTraceMalloc_Track
+// itself, ahead of any preload: an extension's calls never reach ours. Their GOT slots are pointed at
+// ours instead, each time an extension loads (its PyInit_ lookup comes before its code runs).
+static void py_patch(void) {
+  static const char *const n[] = {"PyTraceMalloc_Track", "PyTraceMalloc_Untrack"};
+  static void *o[2];
+  Dl_info me;
+  dladdr((void *)py_patch, &me);
+  if (!o[0]) { void *h = dlopen(me.dli_fname, RTLD_NOW | RTLD_NOLOAD); for (int i = 0; h && i < 2; i++) o[i] = r_dlsym(h, n[i]); }
+  pnames = n; pown = o; npatch = 2;
+  dl_iterate_phdr(patch_cb, me.dli_fbase);
+  pnames = hooked; pown = own; npatch = sizeof hooked / sizeof *hooked;
+}
 // --py: the Python runner's own SIGTERM/SIGHUP handler writes its section, then calls this.
 HOOK void heaptide_final(void) { report(1); }
 // --py: the runner's handler is installed; a stop signal held until now is sent again
@@ -1060,6 +1306,7 @@ static void fork_unlock(void) {
 // sampler restarted.
 static void forked(void) {
   fork_unlock();
+  if (done) return;  // after the final report or a detach: nothing to restart
   flush_all();
   for (int i = 0; i < SHARDS; i++)
     for (size_t j = 0; j < live[i].cap; j++) live[i].t[j].v |= live[i].t[j].k ? REACH : 0;
@@ -1072,6 +1319,13 @@ static void forked(void) {
 }
 
 __attribute__((constructor)) static void init(void) {
+  { // one unwind now: libunwind's thread key is created while few exist (an index under 32 needs no
+    // glibc key block, so pthread_setspecific never allocates inside a hook); its handle for unw_ready
+    void *b[2]; Dl_info u; size_t mod = 0;
+    guard = 1; unw_backtrace(b, 2); guard = 0;
+    if (dladdr((void *)unw_backtrace, &u) && (unw_h = dlopen(u.dli_fname, RTLD_NOW | RTLD_NOLOAD)) && (dlinfo(unw_h, RTLD_DI_TLS_MODID, &mod) || !mod))
+      unw_h = 0;  // no thread-local state: always ready
+  }
   resolve();
   // Mojo allocates through its bundled tcmalloc, which malloc hooks never see. Its runtime's sanitizer
   // switch routes every Mojo allocation to libc malloc/aligned_alloc/free instead (and no tcmalloc

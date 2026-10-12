@@ -160,26 +160,36 @@ def sq(s: String) -> String:  # one shell word, whatever the path holds
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def is_exec(path: String) -> Bool:  # ET_EXEC (non-PIE): the symbolizer wants the absolute address
+def elf_type(path: String) -> Int:  # 0 not ELF (a font, a data file); 2 ET_EXEC: the symbolizer wants the absolute address
     try:
         with open(path, "r") as f:
             var h = f.read_bytes(18)
-            return len(h) == 18 and h[16] == 2
+            return Int(h[16]) if len(h) == 18 and h[0] == 0x7F and h[1] == 0x45 and h[2] == 0x4C and h[3] == 0x46 else 0
     except:
-        return False
+        return 0
 
 
 def user_file(path: String) -> Bool:
     return path.startswith("/") and not path.startswith("/usr/") and not path.startswith("/opt/") and not ("/.venv/" in path)
 
 
-def symbolize(stacks: List[Stack], wanted: List[Int], roots: List[UInt64], maps: List[Mapping], dir: String, pid: String) raises -> Dict[Int, String]:
-    # site per stack index: first 2 frames outside libheaptide + first frame in the user's own source
-    var req = String()
-    var keys = List[Int]()
-    var mods = List[String]()
-    var pys = List[String]()  # a Python function from CPython's perf map (-X perf), else ""
-    var p_lo = List[UInt64]()  # CPython's perf map: one stub range per Python function
+@fieldwise_init
+struct Frame(Copyable, Movable):
+    var func: String  # symbol, py::name file, [jit runtime] or [module+0xoffset]
+    var loc: String  # file:line:col from the symbolizer, "??..." when unknown
+    var user: Bool  # the user's own code: own source file, own executable, a Python function
+    var shown: Bool  # False: libheaptide's own frame, or an address in no mapping
+
+    def text(self) -> String:
+        if self.loc.startswith("??"):
+            return self.func
+        var slash = self.loc.rfind("/")
+        return String(self.func, " ", String(self.loc[byte=slash + 1 :]) if slash >= 0 else self.loc)
+
+
+def resolve_frames(ips: List[UInt64], roots: List[UInt64], maps: List[Mapping], dir: String, pid: String, mut root_names: List[String]) raises -> List[Frame]:
+    # One llvm-symbolizer batch for these (distinct) addresses, plus the globals in roots ("DATA").
+    var p_lo = List[UInt64]()  # CPython's perf map (-X perf): one stub range per Python function
     var p_hi = List[UInt64]()
     var p_name = List[String]()
     try:
@@ -195,42 +205,60 @@ def symbolize(stacks: List[Stack], wanted: List[Int], roots: List[UInt64], maps:
                     p_name.append(String("py::", nm[byte=:colon], " ", nm[byte=nm.rfind("/") + 1 :]) if colon > 0 else String("py::", nm))
     except:
         pass
-    var offs = List[UInt64]()  # module-relative address: names a frame no symbol table covers
     var exe = String(maps[0].path[byte=maps[0].path.rfind("/") + 1 :]) if len(maps) > 0 else String()
     var fixed = List[Bool]()
+    var elf = List[Bool]()
     for m in maps:
-        fixed.append(is_exec(m.path))
-    for w in wanted:
-        for ip in stacks[w].ips:
-            for mi in range(len(maps)):
-                ref m = maps[mi]
-                if ip >= m.start and ip < m.end:
-                    if not m.path.endswith("libheaptide.so"):
-                        req += '"' + m.path + '" 0x' + hex(ip - (0 if fixed[mi] else m.start) - 1)[byte=2:] + "\n"
-                        keys.append(w)
-                        mods.append(String(m.path[byte=m.path.rfind("/") + 1 :]))
-                        pys.append(String())
-                        offs.append(ip - (0 if fixed[mi] else m.start))
+        var t = elf_type(m.path)
+        fixed.append(t == 2)
+        elf.append(t != 0)
+    var req = String()
+    var at = List[Int]()  # per address: its request, or -1 (never shown)
+    var mods = List[String]()  # per request
+    var pys = List[String]()  # a Python function or JIT runtime that names the frame, else ""
+    var offs = List[UInt64]()  # module-relative address: names a frame no symbol table covers
+    for ip in ips:
+        var q = len(mods)
+        for mi in range(len(maps)):
+            ref m = maps[mi]
+            if ip >= m.start and ip < m.end:
+                if m.path.startswith("/memfd:"):  # JIT code (QML's V4): no symbols, named by its runtime
+                    var tag = String(m.path[byte=: m.path.find(" (deleted)")]) if m.path.find(" (deleted)") > 0 else m.path
+                    req += '"' + maps[0].path + '" 0x0\n'  # a quiet ?? answer
+                    mods.append(String())
+                    offs.append(0)
+                    pys.append(String("[jit ", tag[byte=tag.rfind(":") + 1 :], "]"))
+                elif not m.path.endswith("libheaptide.so"):  # outside an ELF file (a bad unwind into a font): unnamed
+                    req += ('"' + m.path + '" 0x' + hex(ip - (0 if fixed[mi] else m.start) - 1)[byte=2:] + "\n") if elf[mi] else ('"' + maps[0].path + '" 0x0\n')
+                    mods.append(String(m.path[byte=m.path.rfind("/") + 1 :]))
+                    pys.append(String())
+                    offs.append(ip - (0 if fixed[mi] else m.start))
+                break
+        else:  # in no file: a perf-map stub is a Python function
+            for pi in range(len(p_lo)):
+                if ip >= p_lo[pi] and ip < p_hi[pi]:
+                    req += '"' + maps[0].path + '" 0x0\n'
+                    mods.append(String())
+                    offs.append(0)
+                    pys.append(p_name[pi])
                     break
-            else:  # in no file: a perf-map stub is a Python function (the symbolizer gets a dummy line)
-                for pi in range(len(p_lo)):
-                    if ip >= p_lo[pi] and ip < p_hi[pi]:
-                        req += '"/dev/null" 0x0\n'
-                        keys.append(w)
-                        mods.append(String())
-                        offs.append(0)
-                        pys.append(p_name[pi])
-                        break
+        at.append(q if len(mods) > q else -1)
+    var nq = len(mods)
     for ri in range(len(roots)):  # globals holding a chain: "DATA" lookups answer name + "start size"
+        var found = False
         for mi in range(len(maps)):
             ref m = maps[mi]
             if roots[ri] >= m.start and roots[ri] < m.end:
                 offs.append(roots[ri] - (0 if fixed[mi] else m.start))
                 req += 'DATA "' + m.path + '" 0x' + hex(offs[len(offs) - 1])[byte=2:] + "\n"
-                keys.append(-1 - ri)
                 mods.append(String(m.path[byte=m.path.rfind("/") + 1 :]))
                 pys.append(String())
+                found = True
                 break
+        if not found:
+            mods.append(String())  # keeps root_names aligned with roots: no request, no answer
+            pys.append(String("?"))
+            offs.append(0)
     var inp = dir + "/.sym." + pid + ".in"
     var outp = dir + "/.sym." + pid + ".out"
     with open(inp, "w") as f:
@@ -240,7 +268,7 @@ def symbolize(stacks: List[Stack], wanted: List[Int], roots: List[UInt64], maps:
     var text = String()
     if rc == 3 << 8:  # no symbolizer: sites name modules only
         print("note: no llvm-symbolizer (install LLVM or set HEAPTIDE_SYMBOLIZER); sites show modules only", file=stderr)
-        for _ in range(len(keys)):
+        for _ in range(len(mods)):
             text += "??\n??:0\n\n"
     elif rc != 0:
         raise Error("FAIL symbolize: llvm-symbolizer failed")
@@ -248,46 +276,67 @@ def symbolize(stacks: List[Stack], wanted: List[Int], roots: List[UInt64], maps:
         with open(outp, "r") as f:
             text = f.read()
     var lines = text.split("\n")
-    var sites = Dict[Int, String]()
-    var shown = Dict[Int, Int]()  # frames shown; 100 + n once a user frame is in
+    var answers = List[Frame]()
     var li = 0
-    for ki in range(len(keys)):
-        var k = keys[ki]
+    for qi in range(len(mods)):
+        if qi >= nq and pys[qi] == "?":  # a root in no mapping
+            root_names.append(String("?"))
+            continue
         while li < len(lines) and lines[li].byte_length() == 0:
             li += 1
-        if li + 1 >= len(lines):
-            break
-        var loc = String(lines[li + 1])
-        var func = String(lines[li])
-        if pys[ki].byte_length() > 0:
-            func = pys[ki]
+        var func = String(lines[li]) if li < len(lines) else String("??")
+        var loc = String(lines[li + 1]) if li + 1 < len(lines) else String("??:0")
+        li += 2
+        if pys[qi].byte_length() > 0:
+            func = pys[qi]
         elif func == "??":
-            func = "[" + mods[ki] + "+0x" + hex(offs[ki])[byte=2:] + "]"
+            func = "[" + mods[qi] + "+0x" + hex(offs[qi])[byte=2:] + "]"
         elif func.find("::") >= 0 and func.find("(") > 0:  # Mojo/C++: the signature is noise, keep the qualified name
             var name = String(func[byte=: func.find("(")])
             func = name^
-        li += 2
-        if k < 0:  # DATA: name, "start size", and on newer LLVM the declaration's file:line
+        if qi >= nq:  # DATA: name, "start size", and on newer LLVM the declaration's file:line
             if li < len(lines) and lines[li].byte_length() > 0:
                 li += 1
-            sites[k] = String("global ", func, " (", mods[ki], ")") if not func.startswith("[") else func
+            root_names.append(String("global ", func, " (", mods[qi], ")") if not func.startswith("[") else func)
             continue
-        var n = shown.get(k, 0)
         # user frame: own source file, or (no debug info) a frame in the program's own executable
-        var user = (user_file(String(loc[byte=: loc.find(":")])) if loc.find(":") > 0 else False) or (loc.startswith("??") and mods[ki] == exe and not exe.startswith("python")) or pys[ki].byte_length() > 0  # a static python: its frames are the interpreter
-        # tracemalloc's hooks are heaptide's own instrumentation in --py mode, like libheaptide
-        if n >= 100 or (n >= 2 and not user) or func.startswith("tracemalloc_"):
-            continue
-        var slash = loc.rfind("/")
-        var frame = func if loc.startswith("??") else String(func, " ", String(loc[byte=slash + 1 :]) if slash >= 0 else loc)
-        sites[k] = (sites[k] + " <- " + frame) if k in sites else frame
-        shown[k] = 100 + n if user else n + 1
+        var user = (user_file(String(loc[byte=: loc.find(":")])) if loc.find(":") > 0 else False) or (loc.startswith("??") and mods[qi] == exe and not exe.startswith("python")) or (pys[qi].byte_length() > 0 and not func.startswith("[jit "))  # a static python: its frames are the interpreter
+        answers.append(Frame(func^, loc^, user, True))
+    var frames = List[Frame]()
+    for a in at:
+        frames.append(answers[a].copy() if a >= 0 else Frame(String(), String("??"), False, False))
+    return frames^
+
+
+def symbolize(stacks: List[Stack], wanted: List[Int], roots: List[UInt64], maps: List[Mapping], dir: String, pid: String) raises -> Dict[Int, String]:
+    # site per stack index: first 2 frames outside libheaptide + first frame in the user's own source
+    var idx = Dict[UInt64, Int]()  # each address once in the batch (a frame shared by many stacks was asked many times)
+    var uniq = List[UInt64]()
+    for w in wanted:
+        for ip in stacks[w].ips:
+            if ip not in idx:
+                idx[ip] = len(uniq)
+                uniq.append(ip)
+    var root_names = List[String]()
+    var frames = resolve_frames(uniq, roots, maps, dir, pid, root_names)
+    var sites = Dict[Int, String]()
+    for w in wanted:
+        var n = 0  # frames shown; 100 + n once a user frame is in
+        for ip in stacks[w].ips:
+            ref f = frames[idx[ip]]
+            if not f.shown or n >= 100 or (n >= 2 and not f.user) or (f.func.startswith("[jit ") and w in sites and sites[w].endswith(f.func)):
+                continue
+            sites[w] = (sites[w] + " <- " + f.text()) if w in sites else f.text()
+            n = 100 + n if f.user else n + 1
+    for ri in range(len(roots)):
+        if root_names[ri] != "?":  # in no mapping: unnamed, as the printer expects
+            sites[-1 - ri] = root_names[ri]
     return sites^
 
 
 def chain(held: Span[UInt64, _], w: Int) -> List[UInt64]:
     # who holds site w: its first holder's holder, up to 6 hops; ends at a root (bit 63 a global's
-    # address, bit 62 a thread, bit 61 memory from before attach), at 0 (held by nothing recorded) or where a site repeats
+    # address, bit 62 a thread, bit 61 memory from before attach, bit 60 a memfd heap), at 0 (held by nothing recorded) or where a site repeats
     var out = List[UInt64]()
     var at = w
     while len(out) < 6 and at < len(held) and held[at] != 0:
@@ -295,7 +344,7 @@ def chain(held: Span[UInt64, _], w: Int) -> List[UInt64]:
         if h in out:
             break
         out.append(h)
-        if h >> 61 != 0:
+        if h >> 60 != 0:
             break
         at = Int(h) - 1
     return out^
@@ -314,6 +363,8 @@ def held_by(c: List[UInt64], sites: Dict[Int, String], roots: List[UInt64]) -> S
             name = String("a thread's stack")
         elif h >> 61 == 1:
             name = String("memory from before attach")
+        elif h >> 60 == 1:
+            name = String("a memfd mapping (a VM or JIT heap)")
         else:
             name = sites.get(Int(h) - 1, String("?"))
         t += (" << " if t.byte_length() > 0 else "") + name  # "<-" already joins frames inside a site
@@ -383,16 +434,28 @@ def fit(b: List[UInt8], smp_at: Int, a: Int, nsamp: Int, span: Float64, limit: F
 
 def site_key(s: String) -> String:
     # a site without its ":line:col": a change that only moves code keeps its sites
+    # (a ":" is dropped only when digits follow it: "QString::append" keeps its "::")
     var out = String()
+    var colon = False
     var skip = False
     for c in s.codepoint_slices():
         if c == ":":
+            if colon:
+                out += ":"
+            colon = True
+            skip = False
+            continue
+        if (colon or skip) and c.is_ascii_digit():
+            colon = False
             skip = True
             continue
-        if skip and c.is_ascii_digit():
-            continue
+        if colon:
+            out += ":"
+        colon = False
         skip = False
         out += c
+    if colon:
+        out += ":"
     return out^
 
 
@@ -457,6 +520,159 @@ def diff(a_path: String, b_path: String, fail_on: String, as_json: Bool) raises 
     return 1 if len(lines[0]) > 0 or (fail_on == "grown" and len(lines[1]) > 0) else 0
 
 
+def metric(s: Stack, m: Int) -> UInt64:  # 0 leaked, 1 live, 2 peak, 3 allocated, 4 temporaries
+    if m == 0:
+        return s.direct + s.indirect
+    if m == 1:
+        return s.live_b
+    if m == 2:
+        return s.peak_b
+    return s.bytes if m == 3 else s.temps
+
+
+def flame(stacks: List[Stack], maps: List[Mapping], b: List[UInt8], smp_at: Int, nsamp: Int, dir: String, pid: String, attached: Bool, folded: Int) raises -> String:
+    # Every stack that made or holds anything, merged into one call tree (root -> kind -> frames, outermost
+    # first): JSON for heaptide flame, or with folded >= 0 one "f;f;f bytes" line per stack for any viewer.
+    var idx = Dict[UInt64, Int]()
+    var uniq = List[UInt64]()
+    for st in stacks:
+        for ip in st.ips:
+            if ip not in idx:
+                idx[ip] = len(uniq)
+                uniq.append(ip)
+    var none = List[String]()
+    var fr = resolve_frames(uniq, List[UInt64](), maps, dir, pid, none)
+    var exe = String(maps[0].path[byte=maps[0].path.rfind("/") + 1 :]) if len(maps) > 0 else String("?")
+    if folded >= 0:
+        var out = String()
+        for st in stacks:
+            var w = metric(st, folded)
+            if w == 0:
+                continue
+            var line = String(exe, " (", pid, ");[", kind_name(st.kind), "]")
+            for d in range(len(st.ips) - 1, -1, -1):
+                ref f = fr[idx[st.ips[d]]]
+                if f.shown:
+                    line += ";" + f.text().replace(";", ":")
+            out += line + " " + String(w) + "\n"
+        return out^
+    # frames: one per (function, file, line); strings interned
+    var fid = List[Int]()  # per distinct address
+    var keys = Dict[String, Int]()
+    var names = Dict[String, Int]()
+    var files = Dict[String, Int]()
+    var f_name = List[Int]()
+    var f_file = List[Int]()
+    var f_line = List[Int]()
+    var f_cat = List[Int]()  # 0 user, 1 python, 2 system, 3 jit
+    for ref f in fr:
+        if not f.shown:
+            fid.append(-1)
+            continue
+        var c1 = f.loc.find(":")
+        var c2 = f.loc.find(":", c1 + 1) if c1 >= 0 else -1
+        var file = String(f.loc[byte=:c1]) if c1 > 0 and not f.loc.startswith("??") else String()
+        var line = 0
+        try:
+            line = Int(f.loc[byte=c1 + 1 : c2 if c2 > 0 else f.loc.byte_length()]) if file.byte_length() > 0 else 0
+        except:
+            pass
+        var k = String(f.func, "\t", file, "\t", line)
+        if k not in keys:
+            keys[k] = len(f_name)
+            if f.func not in names:
+                names[f.func] = len(names)
+            if file not in files:
+                files[file] = len(files)
+            f_name.append(names[f.func])
+            f_file.append(files[file])
+            f_line.append(line)
+            f_cat.append(1 if f.func.startswith("py::") else (3 if f.func.startswith("[jit ") else (0 if f.user else 2)))
+        fid.append(keys[k])
+    var parent: List[Int] = [-1]
+    var frame: List[Int] = [-100]  # -100 the process, -1 - kind a kind node, else a frame
+    var selfw = List[List[UInt64]]()
+    for _ in range(5):
+        selfw.append([UInt64(0)])
+    var child = Dict[Int, Int]()  # parent * stride + frame -> node
+    var stride = len(f_name) + 200
+    var totals = List[UInt64](length=5, fill=0)
+    for st in stacks:
+        var cur = 0
+        var d = len(st.ips)
+        var fr_k = -1 - st.kind
+        while True:  # the kind node, then the frames from the outermost in
+            var key = cur * stride + fr_k + 101
+            if key in child:
+                cur = child[key]
+            else:
+                child[key] = len(parent)
+                parent.append(cur)
+                frame.append(fr_k)
+                for m in range(5):
+                    selfw[m].append(0)
+                cur = len(parent) - 1
+            fr_k = -1000
+            while d > 0 and fr_k < 0:
+                d -= 1
+                fr_k = fid[idx[st.ips[d]]]
+            if fr_k < 0:
+                break
+        for m in range(5):
+            selfw[m][cur] += metric(st, m)
+            totals[m] += metric(st, m)
+    var o = String('{"pid":', pid, ',"exe":', jstr(maps[0].path if len(maps) > 0 else String("?")), ',"attached":', "true" if attached else "false",
+                   ',"metrics":["leaked","live","peak","allocated","temporaries"],"totals":[')
+    for m in range(5):
+        o += String(totals[m]) + ("," if m < 4 else "]")
+    def strs(d: Dict[String, Int]) -> String:
+        var a = List[String](length=len(d), fill=String())
+        for e in d.items():
+            a[e.value] = jstr(e.key)
+        return String("[", ",".join(a), "]")
+    def ints(a: List[Int]) -> String:
+        var t = String("[")
+        for i in range(len(a)):
+            t += String(a[i]) + ("," if i + 1 < len(a) else "")
+        return t + "]"
+    o += ',"names":' + strs(names) + ',"files":' + strs(files)
+    o += ',"frames":{"name":' + ints(f_name) + ',"file":' + ints(f_file) + ',"line":' + ints(f_line) + ',"cat":' + ints(f_cat) + "}"
+    o += ',"nodes":{"parent":' + ints(parent) + ',"frame":' + ints(frame) + ',"self":['
+    for m in range(5):
+        var t = String("[")
+        for i in range(len(selfw[m])):
+            t += String(selfw[m][i]) + ("," if i + 1 < len(selfw[m]) else "")
+        o += t + ("]," if m < 4 else "]]}")
+    # live bytes over time, at most 1500 points (each the bucket's highest)
+    var step = max(1, (nsamp + 1499) // 1500)
+    var ts = String()
+    var cpu = String()
+    var gpu = String()
+    var t0 = u64(b, smp_at) if nsamp > 0 else 0
+    var i = 0
+    while i < nsamp:
+        var hc: UInt64 = 0
+        var hg: UInt64 = 0
+        for j in range(i, min(i + step, nsamp)):
+            hc = max(hc, u64(b, smp_at + j * 24 + 8))
+            hg = max(hg, u64(b, smp_at + j * 24 + 16))
+        var sep = "," if i > 0 else ""
+        ts += sep + short(Float64(u64(b, smp_at + i * 24) - t0) / 1e9)
+        cpu += sep + String(hc)
+        gpu += sep + String(hg)
+        i += step
+    o += String(',"samples":{"t":[', ts, '],"cpu":[', cpu, '],"gpu":[', gpu, "]}")
+    var py = List[String]()
+    try:
+        with open(dir + "/py." + pid + ".txt", "r") as f:
+            for l in f.read().split("\n"):
+                if l.byte_length() > 0:
+                    py.append(jstr(String(l.strip())))
+    except:
+        pass
+    return o + ',"python":[' + ",".join(py) + "]}"
+
+
 def main() raises:
     var args = argv()
     if len(args) >= 4 and String(args[1]) == "--diff":
@@ -480,16 +696,20 @@ def main() raises:
     var fail_on = String("any")
     var limit = 0.0  # --growth-limit, bytes; 0 = relative rule only
     var sites_out = String()  # --sites FILE: one line per site, for diff
+    var flame_data = False  # --flame-data: the call tree as JSON, for heaptide flame
+    var folded = -1  # --folded METRIC: "frame;frame;frame bytes" lines
+    var flames = List[String]()
     # glibc's dlerror buffer: freed by libc at exit without passing through malloc's hooks
     var supp: List[String] = ["_dlerror_run"]
     var i = 2
     while i < len(args):
         var flag = String(args[i])
-        if flag == "--json":
-            as_json = True
+        if flag == "--json" or flag == "--flame-data":
+            as_json = as_json or flag == "--json"
+            flame_data = flame_data or flag == "--flame-data"
             i += 1
             continue
-        if flag not in ["--top", "--growth-limit", "--fail-on", "--supp", "--sites"]:
+        if flag not in ["--top", "--growth-limit", "--fail-on", "--supp", "--sites", "--folded"]:
             print("FAIL report: unknown option", flag, file=stderr)
             exit(2)
         if i + 1 >= len(args):
@@ -509,6 +729,13 @@ def main() raises:
                 sites_out = v
                 with open(v, "w") as f:  # truncated once; each process appends its sites
                     f.write("")
+            elif flag == "--folded":
+                var ms: List[String] = ["leaked", "live", "peak", "allocated", "temporaries"]
+                for m in range(len(ms)):
+                    if ms[m] == v:
+                        folded = m
+                if folded < 0:
+                    raise Error()
             elif flag == "--fail-on":
                 fail_on = v
                 if fail_on not in ["any", "leaks", "growth", "none"]:
@@ -566,6 +793,7 @@ def main() raises:
         var has_blk = (u64(b, 48) & 1) == 1
         var has_held = (u64(b, 48) & 4) == 4  # since v0.1.4: per site, its first holder
         var has_maps = (u64(b, 48) & 2) == 2  # since v0.1.3 the maps text ends the .bin; older: a .maps file
+        var attached = (u64(b, 48) & 16) == 16  # since v0.1.5: live bytes start at 0 at attach, so no growth verdict
         var nmaps = Int(u64(b, 56)) if has_maps and u64(b, 56) < 1 << 31 else 0
         var ips_at = 64
         var rows_at = ips_at + nips * 8
@@ -603,6 +831,9 @@ def main() raises:
             with open(dir + "/heaptide." + pid + ".maps", "r") as f:
                 maps_text = f.read()
         var maps = load_maps(maps_text)
+        if flame_data or folded >= 0:
+            flames.append(flame(stacks, maps, b, smp_at, nsamp, dir, pid, attached, folded))
+            continue
         var all_ids = List[Int]()
         var leaking = List[Int]()  # all of them: totals and suppressions must not stop at a display cap
         for s in range(len(stacks)):
@@ -626,7 +857,7 @@ def main() raises:
             for h in chain(held, w):
                 if h >> 63 == 1:
                     roots.append(h & ~(UInt64(1) << 63))
-                elif h >> 61 == 0 and not seen[Int(h) - 1]:
+                elif h >> 60 == 0 and not seen[Int(h) - 1]:
                     seen[Int(h) - 1] = True
                     wanted.append(Int(h) - 1)
         var tl_ids = List[UInt64]()  # timeline rows, with the most each held
@@ -677,10 +908,10 @@ def main() raises:
         # GROWTH: slope of live bytes after the first 20% of samples; when that fails, the window
         # start moves later (up to half the run) to skip a long setup, and the earliest window whose
         # slope, projected over the full span, passes wins
-        var verdict = String("too short")
+        var verdict = String("attached" if attached else "too short")
         var g = SIMD[DType.float64, 4](0)
         var settled = 0
-        if nsamp >= 5:
+        if nsamp >= 5 and not attached:
             settled = nsamp // 5
             var span = Float64(u64(b, smp_at + (nsamp - 1) * 24) - u64(b, smp_at + settled * 24)) / 1e9
             g = fit(b, smp_at, settled, nsamp, span, limit)
@@ -748,9 +979,12 @@ def main() raises:
         print("LEAKS  direct", human(leak_d), " indirect", human(leak_i))
         for l in leak_lines:
             print(l)
-        print("GROWTH ", verdict, " slope", human(UInt64(max(slope, 0.0))), "/s  over window", human(UInt64(max(grow, 0.0))),
-              String(" (", Int(100.0 * max(grow, 0.0) / g[2]) if g[2] > 0 else 0, "% of mean)"),
-              ("  window from " + steady + " s") if steady.byte_length() > 0 else String())
+        if attached:
+            print("GROWTH  n/a (attached: live bytes count from 0 at attach, a ramp is not growth; use heaptide diff)")
+        else:
+            print("GROWTH ", verdict, " slope", human(UInt64(max(slope, 0.0))), "/s  over window", human(UInt64(max(grow, 0.0))),
+                  String(" (", Int(100.0 * max(grow, 0.0) / g[2]) if g[2] > 0 else 0, "% of mean)"),
+                  ("  window from " + steady + " s") if steady.byte_length() > 0 else String())
         if len(tl_ids) > 0 and nsamp > 0:
             var ramp: List[String] = [" ", ".", ":", "-", "=", "+", "*", "#", "%", "@"]
             var order = List[Int]()  # the 5 rows that held the most
@@ -791,6 +1025,12 @@ def main() raises:
     if nbin == 0:
         print("FAIL report: no heaptide.*.bin in", dir, file=stderr)
         exit(2)
+    if folded >= 0:
+        print("".join(flames), end="")
+        exit(0)
+    if flame_data:
+        print("[" + ",".join(flames) + "]")
+        exit(0)
     if as_json:
         print(json + "]")
     exit(1 if bad else 0)

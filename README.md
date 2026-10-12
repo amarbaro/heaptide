@@ -13,8 +13,10 @@ heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--
 heaptide snapshot DIR                                  a running process writes its report now
 heaptide diff BASE NEW [--fail-on new|grown|none] [--json] [--top N]   exit 1 on a new leak site
 heaptide attach PID [--out DIR]                        a running process, no restart (gdb; sudo under Yama 1)
+heaptide detach DIR                                    a last snapshot, then the process runs on untracked
+heaptide flame DIR [-o OUT.html] [--open]              every call path as an interactive flame graph, one offline page
 heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none]
-                    [--growth-limit MIB]
+                    [--growth-limit MIB] [--folded leaked|live|peak|allocated|temporaries]
 ```
 
 ## One report answers five questions
@@ -58,6 +60,22 @@ TEMPORARIES (alloc then free)
 A fifth section, **PYTHON**, appears with `--py`: still-allocated memory by Python source line.
 The report exits 1 because there are leaks (`--fail-on` picks what counts).
 
+## Every call path at once: `heaptide flame`
+
+![heaptide flame: a Python program's allocations, Python frames inside CPython's native stacks](docs/img/flame.png)
+
+`heaptide flame DIR --open` turns a report into one HTML file: no network, nothing to install,
+safe to attach to a ticket. Width is bytes. Switch between leaked, live, peak, allocated and
+temporaries; flip to an inverted view (each allocating function at the root, all its callers
+merged); hide libc and runtime frames; search with a regex and see how many bytes match; click to
+zoom. Python functions (`py::`), JIT code, GPU and mmap allocations keep their own colors, and the
+memory timeline and PYTHON lines sit beside the graph.
+
+It stays fast on large profiles: only boxes at least a third of a pixel wide are drawn, so a
+redraw costs about the same at 10,000 and 300,000 nodes (1.4-2.6 ms in headless Chromium). For
+speedscope, `flamegraph.pl` or inferno, `heaptide report DIR --folded leaked` prints the same
+stacks as folded lines.
+
 ## Install
 
 The release tarball needs no Mojo: Linux x86-64, glibc 2.34 or newer, and `libunwind`
@@ -79,7 +97,7 @@ only.
 ./build.sh          # -> build/libheaptide.so, build/heaptide_report (report built for x86-64-v2, not the build CPU)
 ```
 
-GPU targets need ROCm/HIP. Python mode uses the standard library's `tracemalloc`.
+GPU targets need ROCm/HIP. Python mode hooks CPython's own allocators (no `tracemalloc`).
 
 ## GPU and Python need one flag each
 
@@ -88,16 +106,18 @@ GPU targets need ROCm/HIP. Python mode uses the standard library's `tracemalloc`
   ~490 MiB device pool and a pinned host pool it keeps until exit. Without the flag heaptide sees
   one big block, and the host pool shows up as a leak. Leak findings are the same either way;
   PEAK and peak memory under `--gpu` are those of the unpooled allocator, not of production.
-- `--py CMD` takes a python command (`python script.py ...` or `python -m pkg.module ...`) and runs it under `tracemalloc` with 1 frame;
+- `--py CMD` takes a python command (`python script.py ...` or `python -m pkg.module ...`) and charges every Python
+  allocation to its line, 1 frame deep (CPython's allocator hooks, as memray does; extensions' own buffers, such as numpy's
+  array data, through `PyTraceMalloc_Track`; GIL builds only);
   `--py-depth N` keeps N frames and shows each site as its call chain (on `tests/py_leak.py`:
-  1.14 s at 1 frame, 1.32 s at 2, 2.24 s at 8). Native
+  0.14 s at 1 frame, 0.15 s at 2, 0.20 s at 8, bare 0.05 s). Native
   stacks are capped at 8 frames (`HEAPTIDE_DEPTH`, default 64), because most Python-mode stacks
-  are tracemalloc's own and deeper frames only split them.
+  are CPython's own and deeper frames only split them.
 - `--every MS` sets the GROWTH sampling period (default 100).
 - Long-running processes: SIGTERM, SIGINT and SIGHUP write the report before the process dies of
   the signal (exit status unchanged), unless the program installed its own handler, which is left
   alone (with `--py`, the PYTHON section is written too). `heaptide snapshot DIR` makes a running
-  process write its report now, and
+  process write its report now and returns once it is written (exit 1 after 60 s without one), and
   `--snapshot-every S` does it on a timer; `heaptide report DIR` then shows the latest one. A
   snapshot pauses the program only to fork it (10M live blocks: 15 ms) and scans the copy, which
   can cost up to the heap's size in memory while the program rewrites its pages; it is skipped if
@@ -158,22 +178,32 @@ Ryzen 7 7800X3D, arms interleaved over 8 rounds:
 | bare | 0.02 s | 3.2 MB | |
 | heaptrack 1.5.0 `--record-only` | 1.60-1.82 s (median 1.65) | 65.3 MB | +62.1 MB |
 | heaptide | 0.12-0.14 s (median 0.13) | 12.5 MB | +9.3 MB |
+| Valgrind 3.25.1 massif | 1.97-1.99 s | 31.5-35.8 MB | +29-33 MB |
+| Valgrind 3.25.1 memcheck `--leak-check=full` | 5.55-5.68 s | 84-88 MB | +81-85 MB |
+
+On an allocation-bound loop that is about 16x faster than massif and 48x faster than memcheck
+(Valgrind runs every instruction on its own software CPU, one thread at a time; heaptide only
+intercepts the allocation calls). On `examples/demo.c`, which mostly waits: bare 2.05 s, heaptide
+2.05 s, massif 2.13 s, memcheck 2.35 s, and memcheck and heaptide report the same leaks (12,800 B
+direct, 6,400 B indirect). Memcheck also catches invalid reads and writes, which heaptide does not
+look for. Reproduce with `bench/vs_valgrind.sh` (2026-10-12, load 1.4, 3 runs each).
 
 That is still about 6x slower than no tool on an allocation-bound loop (load average 3 during the
-runs). Python mode costs more: 1.1 s
-for a script that runs in 0.06 s bare, nearly all of it in `tracemalloc`.
+runs). Python mode, on `bench/py_bench.py` (8M live objects, 17M allocations, bare 0.9 s / 569 MB):
+2.9 s / 849 MB, against memray `--trace-python-allocators` at 2.8 s / 617 MB (memray streams to a
+file, heaptide keeps a table). Before v0.1.5 it ran under `tracemalloc`: 30 s / 3.86 GB.
 
 Internals: [docs/how-it-works.md](docs/how-it-works.md). File format:
 [docs/file-format.md](docs/file-format.md).
 
 ## Every claim above has a check
 
-`tests/run.sh` runs 165 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
+`tests/run.sh` runs 187 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
 exact leak bytes, file:line, the direct/indirect split, mmap regions, blocks held only by a
 thread's stack or register, interior pointers, fork, reserve-then-commit mappings, growth after a
 long setup, Python lines, HIP and Mojo GPU leaks, Mojo's CPU heap, who holds reachable memory, ASan
 programs, attaching to a running process, `diff`, the GPU timeline and Python frames in native
-stacks. `tests/run.sh --cpu` runs the 160 that need
+stacks. `tests/run.sh --cpu` runs the 162 that need
 no GPU; CI runs those on Ubuntu 24.04 for every push.
 [docs/testing.md](docs/testing.md) lists them.
 
@@ -214,6 +244,12 @@ directory (for Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/
   `-X perf`, whose per-function stubs are ordinary native frames, and names them from
   `/tmp/perf-<pid>.map` (so the report must run on the same machine). Function names only: the
   PYTHON section keeps the line numbers. A HIP library loaded `RTLD_LOCAL` (ctypes) is tracked too.
+- Private writable memfd mappings (Qt's JavaScript heap, other VM and JIT heaps) are scanned as
+  roots. Before v0.1.5 a QML program holding 2,000 strings showed 968,572 B of false leaks in a
+  snapshot; now 192 B. A stack frame in JIT code (in a memfd) reads `[jit QtQml]`, named by its
+  runtime.
+- `heaptide attach` under `sudo` hands the `--out` directory to the target's owner, so the process
+  can write its report and you can request snapshots.
 - `heaptide attach PID` loads heaptide into a running process through gdb (`dlopen`), then points
   every already-bound GOT slot of a hooked function at heaptide's. It sees only what is allocated
   after attach. Memory from before attach is scanned as a root (minus the blocks tracked since),
@@ -221,7 +257,19 @@ directory (for Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/
   attached report can under-report, never over-report. Mojo's heap stays invisible when attached
   (its allocator switch only works before the first allocation). Under Yama `ptrace_scope` 1 it
   needs `sudo`, or a process that called `prctl(PR_SET_PTRACER, ...)`; `heaptide snapshot DIR`
-  then works as for `run`.
+  then works as for `run`. An attached report has no GROWTH verdict (`GROWTH n/a`, JSON
+  `"growth":"attached"`): live bytes count from 0 at attach and climb as the program replaces
+  older objects, a ramp that read as FAIL on an idle plasmashell. Snapshot twice and `diff` instead.
+  Chromium-based browsers export their own `malloc` (PartitionAlloc), which heaptide forwards to,
+  but their own C++ calls it directly, so only shared libraries' allocations are seen. Before
+  v0.1.5 an attached Vivaldi could hang minutes later: a thread's first stack capture inside the
+  mmap hook allocated through PartitionAlloc while that thread held its lock. Fixed and proven on
+  a stand-in (`tests/c_ownlock.c`), not yet on a Chromium browser itself.
+- `heaptide detach DIR` ends it without a restart: a last snapshot, then the hooks pass through,
+  every GOT slot attach wrote gets its old value back (full RELRO stays read-only), heaptide's
+  signal handlers and sampler go, and its tables go back to the kernel (1M tracked blocks:
+  98.5 MB resident attached, 59.8 MB after detach, the program's own 58 MB). No report at exit.
+  The library stays loaded, inert: code may still hold `&free` from while it was attached.
 - `heaptide diff BASE NEW` compares two report dirs site by site, matched by their function chain
   without line numbers (a change that only moves code keeps its sites): NEW leak sites, GROWN
   (direct or peak up by more than 64 KiB and 10%, a new big peak site included), GONE, SHRUNK.

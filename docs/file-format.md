@@ -33,7 +33,7 @@ Header (u64 each):
 | 3 | `nips`, number of instruction pointers |
 | 4 | `nsamples` |
 | 5 | sampling period in ms |
-| 6 | flags: bit 0 = leaked block counts follow the samples (since v0.1.2; older files: the report shows live blocks); bit 1 = maps text ends the file (since v0.1.3); bit 2 = the retention array follows the leaked block counts (since v0.1.4); bit 3 = the GPU timeline follows it (`--gpu-timeline`, since v0.1.4) |
+| 6 | flags: bit 0 = leaked block counts follow the samples (since v0.1.2; older files: the report shows live blocks); bit 1 = maps text ends the file (since v0.1.3); bit 2 = the retention array follows the leaked block counts (since v0.1.4); bit 3 = the GPU timeline follows it (`--gpu-timeline`, since v0.1.4); bit 4 = written by an attached process (since v0.1.5: no growth verdict) |
 | 7 | length of the maps text in bytes (0 without bit 1) |
 
 Row (56 B, `row_t` in `shim/heaptide.c`, size fixed by a static assert):

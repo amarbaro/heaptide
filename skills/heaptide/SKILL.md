@@ -18,16 +18,21 @@ JSON, not the text: it is the stable interface.
    ```
    heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--gpu-timeline all] --out .work/ht -- <cmd> <args>
    heaptide report .work/ht --json > .work/ht/report.json
+   heaptide flame .work/ht --open      # for a person: every call path as an offline flame graph
    ```
    - Already running and must not restart: `sudo heaptide attach PID --out .work/ht` (gdb loads
      heaptide into it), then `heaptide snapshot .work/ht`. It sees only what is allocated after
      attach and can under-report (never over-report); Mojo's heap stays invisible when attached.
+     Done: `heaptide detach .work/ht` (last snapshot, then untracked; no restart, no sudo).
+     Chromium-based browsers: only shared libraries' allocations are seen (PartitionAlloc is
+     called directly); a pre-v0.1.5 attach could hang them. Never attach to a browser in use.
    - `--gpu-timeline all` (or `sites,streams,frag`) when the question is which GPU site filled VRAM
      when, per HIP stream, or how much the device holds beyond live blocks.
    - Build C/C++ with `-g` and Mojo with `-g1` (full `-g` can fail on large kernels), or sites
      stop at the executable's symbol.
    - `--gpu` for any Mojo GPU program. Without it Mojo pools its buffers and you see one block.
-   - `--py` for a Python entry point (the command must be `python...`). On Python 3.12+ native and
+   - `--py` for a Python entry point (the command must be `python...`; GIL builds only, about
+     memray's speed). On Python 3.12+ native and
      GPU sites end in the Python function that made them (`<- py::load_weights train.py`); the
      report must run on the same machine (it reads `/tmp/perf-<pid>.map`). Add `--py-depth 4` when
      one helper is called from many places: PYTHON then shows each call chain, not one line.
@@ -41,7 +46,7 @@ JSON, not the text: it is the stable interface.
 3. **Read** `report.json`: one object per process. Children are traced too; the target is
    usually the object with the most leak sites.
    ```
-   {"pid", "direct", "indirect", "growth": "PASS|FAIL|too short", "growth_bytes_per_s",
+   {"pid", "direct", "indirect", "growth": "PASS|FAIL|too short|attached", "growth_bytes_per_s",
     "growth_window_bytes", "window_from_s",
     "leaks": [{"bytes", "direct", "indirect", "blocks", "kind": "cpu|gpu|host|mmap", "site"}],
     "held": [{"site", "held_by"}],            // who holds a PEAK site now: "make_table x.c:7 << global g_cache"
@@ -67,6 +72,7 @@ Exit codes: `report` returns 0 clean, 1 leak or growth (per `--fail-on any|leaks
 | a few hundred B in `hsa_amd_signal_create`, `amd::roc::Device`, `_dl_*` | HIP/Mojo runtime residue | suppress, do not "fix" |
 | GROWTH FAIL, few direct leaks | memory held, not lost: caches, queues, pools that keep growing | read `held` (`held by:` under PEAK): it names the holder chain, from the site to a global, a thread's stack, or memory from before attach. Holders are recorded for memory live at the report: for a service, `heaptide snapshot` while it grows |
 | GROWTH `too short` | fewer than 5 samples | run longer or lower `--every` |
+| GROWTH `n/a` (JSON `attached`) | attached: live bytes count from 0 at attach, so their ramp is not growth | `heaptide snapshot` twice while it runs, then `heaptide diff A B` |
 
 Suppress with `--supp FILE` (one substring of a site per line). Keep the file next to the test that
 uses it and say in a comment why each line is residue.
@@ -112,7 +118,8 @@ when the question is "where does memory go", not "what leaked".
   is skipped when attached.
 - A snapshot never interrupts a thread asleep in a syscall; such a thread's saved registers are
   not scanned, so in a snapshot (never at exit) a block held only there can show as leaked.
-- Overhead is about 25x on allocation-bound loops; time-sensitive bugs may hide under it.
+- Overhead is about 6x on an allocation-bound loop (`bench/alloc_bench`: 0.02 s bare, 0.13 s) and
+  near zero on code that mostly waits; time-sensitive bugs may still hide under it.
 - Linux x86-64 only.
 
 ## Reporting back

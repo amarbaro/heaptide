@@ -42,14 +42,43 @@ site the report shows (direct, indirect, peak, live, kind, site), then `report -
 on kind plus the site with every `:line:col` removed and compares. Nothing is re-analysed: it
 costs two reports (two 65 536-site reports: 2.7 s).
 
+**memfd heaps.** Qt's JavaScript engine (and other VMs and JITs) keeps its garbage-collected heap
+in private writable memfd mappings (`/memfd:JSGCHeap:QtQml`, `JSVMStack`, `unknown-usage`). They
+carry a path, so they are neither tracked blocks nor anonymous memory; every report scans them as
+roots (skipping the blocks tracked inside), so what a script holds is reachable. A holder chain
+shows them as "a memfd mapping (a VM or JIT heap)". Shared memfd mappings (`wayland-shm`) hold
+pixels, not pointers, and are not scanned. A stack frame inside any memfd mapping is generated
+code (`JITCode:QtQml`, or a range V4 has since recycled for its heap): it has no symbols, so the
+report names it `[jit <runtime>]` (the name after the last `:`) and collapses a run of them into one.
+
 **Attach.** `heaptide attach PID` has gdb call `setenv` (output dir, attach flag) and `dlopen` in
 the target. The constructor then cannot rely on interposition: the program's GOT slots were bound
 before the library existed. It walks every loaded object's `DT_JMPREL` and `DT_RELA` relocations
 (`JUMP_SLOT`, `GLOB_DAT`) and writes its own address into each slot that names a hooked function
 (its own definitions come from its own `dlopen` handle, since a plain `&malloc` would bind to
-libc's). It also records the writable anonymous mappings and `[heap]` present at that moment: at
+libc's). Its hooks then forward to what the dynamic linker bound (`dlsym(RTLD_DEFAULT)`), which may be the
+program's own allocator: Chromium's PartitionAlloc and jemalloc builds export `malloc`, and
+`RTLD_NEXT` from a library loaded `RTLD_LOCAL` finds libc's instead, so a block from before attach
+reached libc's `free` and aborted. A stack capture inside an `mmap`-family hook may run while the
+program's allocator holds its lock (PartitionAlloc maps memory under it): a thread's first unwind
+would allocate libunwind's thread-local block through that same allocator (dynamic TLS, as
+libunwind arrived after the program started) and sleep on its own lock. Such a hook therefore
+unwinds only on a thread whose block exists (`dlinfo(RTLD_DI_TLS_DATA)`, which does not allocate);
+until then the event is kept without a stack. It also records the writable anonymous mappings and `[heap]` present at that moment: at
 report time they are scanned as roots, skipping the blocks tracked since attach, so a block that
-is reachable only through older memory is not reported as lost.
+is reachable only through older memory is not reported as lost. The report header carries an
+attached flag: live bytes start at 0 there, so the report gives no growth verdict.
+
+**Detach.** `heaptide detach DIR` takes a snapshot, then creates `OUT/detach`; the sampler sees it
+and sets the flags a final report sets (hooks pass through, no report at exit, sampler stops). It
+walks the loaded objects again and writes back the old value of each slot attach recorded, only
+where the slot still holds heaptide's address (an object dlclosed since is gone from the walk), so
+full RELRO ends read-only as before. Its stop and crash handlers go back to `SIG_DFL` where they are
+still installed; a fork no longer restarts the sampler. The tables are released with
+`MADV_DONTNEED`, each shard under its lock, not unmapped: a thread that was inside a hook when the
+flags flipped finishes on zeroed tables instead of faulting. The library itself stays loaded,
+since the program may hold `&free` taken while attached; those calls pass straight through. The
+sampler removes `OUT/detach` last, which is what `heaptide detach` waits for.
 
 **GPU timeline.** With `--gpu-timeline`, GPU and pinned-host rows skip the per-thread batch (so
 their counts are current) and each new such row is added to a watch list. Every sample, the
@@ -113,7 +142,8 @@ The shim registers its exit handler first, so it runs after the program's own `a
 handlers and static destructors. SIGTERM, SIGINT and SIGHUP get a handler that only sets a flag,
 where the program kept the default; the sampler thread then writes the report and re-raises the
 signal, so the process still dies of it. The sampler also writes snapshots: every
-`--snapshot-every`, or when `OUT/snapshot` appears (`heaptide snapshot`). A snapshot is the same
+`--snapshot-every`, or when `OUT/snapshot` appears (`heaptide snapshot`, which then waits for a
+report newer than its request: the fork writes it after the trigger is gone). A snapshot is the same
 report of a copy: with the threads parked and their stack pointers read, the sampler forks with a
 raw `clone` (no atfork handlers, no malloc locks a parked thread may hold, no exit signal so the
 program's `wait` never sees it) and releases the threads; the child scans its copy-on-write image,
@@ -135,8 +165,40 @@ section, calls the shim's exported `heaptide_final()` (the native report, heap u
 re-raises the signal. A stop signal that arrives before that handler exists (interpreter startup)
 is held by the shim and handed over by `heaptide_py_ready()`, which the runner calls once its
 handler is in; if Python exits first, the shim re-raises it after the report. Ctrl-C needs nothing extra: `KeyboardInterrupt` exits through `atexit`. A
-watcher thread rewrites the PYTHON section whenever the native `.bin` changes, so every snapshot
-has one.
+snapshot's fork writes the PYTHON section from the shim's tables before its `.bin`, so every
+snapshot has one.
+
+**Flame graph (`heaptide flame`, `report --folded`).** The report names every distinct address of
+every stack once (one llvm-symbolizer batch: on `bench/py_bench` 1,597 requests instead of 22,088
+frame occurrences), merges the stacks into one call tree (process, then kind, then frames from the
+outermost in) and writes it as flat arrays: per node its parent, its frame (function, file, line,
+category) and its self bytes for each metric. The launcher splices that JSON into
+`report/flame.html`. The page builds the shown tree from it (inverted, system frames dropped, kinds
+filtered: every node's path is re-inserted with its self weights, so totals never change), lays
+children out heaviest first, and draws on a canvas: a subtree under a third of a pixel is not
+visited, so a redraw touches only the boxes on screen. `--folded` prints one `frame;frame;... bytes`
+line per stack from the same frames.
+
+**Python allocations (`--py`).** The idea is memray's, aggregated in process as the native side is.
+The runner calls `heaptide_py_start()` through `ctypes.PyDLL` (GIL held), which wraps the
+`PYMEM_DOMAIN_MEM` and `PYMEM_DOMAIN_OBJ` allocators with `PyMem_SetAllocator` (the RAW domain is
+`malloc`, already hooked). Each block is charged to a site: the code object and instruction offset
+of its `--py-depth` innermost frames (`PyEval_GetFrame`, `PyFrame_GetLasti`), hashed and looked up
+in a 4096-entry cache. A new site is named once (`co_filename`, `PyCode_Addr2Line`), merged with any
+site of the same name, and its code objects are kept alive in a static array (a freed code object's
+address could otherwise come back as another's, and the leak scan sees them held). Blocks live in
+the shim's own open-addressing table, so nothing is allocated per block. Extensions that allocate
+their own buffers report them through `PyTraceMalloc_Track`/`Untrack` (numpy's array data); the
+shim interposes that pair, takes the GIL, and passes the call on. `heaptide_py_dump()` writes
+`py.<pid>.txt` (the 20 sites holding the most) at `atexit`, before finalization frees the heap.
+A python with libpython inside the executable (Debian, Ubuntu) defines `PyTraceMalloc_Track` itself,
+ahead of any preload: when an extension loads, its `PyInit_` lookup reaches heaptide's `dlsym` hook
+before its code runs, and every loaded object's GOT slots for that pair are pointed at heaptide's.
+heaptide's constructor also unwinds once, so libunwind's thread key is created while few exist: a key
+index under 32 needs no glibc key block, and `pthread_setspecific` never allocates inside a hook.
+Before this, `--py` ran under `tracemalloc`, whose per-trace bookkeeping the native hooks also
+tracked: on `bench/py_bench.py` 30 s and 3.86 GB, now 2.9 s and 849 MB (memray tracing every
+Python allocation: 2.8 s, 617 MB).
 
 0. **List the loaded objects' writable segments** (`dl_iterate_phdr`) while the other threads
    still run: a thread parked inside the loader would hold the lock that call needs.
@@ -195,8 +257,7 @@ debug file by build-id: from elfutils' cache (`~/.cache/debuginfod_client/<id>/d
 with gdb), or fetched with curl from the first `DEBUGINFOD_URLS` server and cached there. ROCm's
 llvm-symbolizer is built without debuginfod, so the report does this itself. A site is the first
 two frames plus the first frame in the user's own source: a path outside `/usr`, `/opt` and
-`.venv`, or, without debug info, a frame in the executable. `tracemalloc_*` frames are skipped
-like libheaptide's: in `--py` mode they are heaptide's own instrumentation.
+`.venv`, or, without debug info, a frame in the executable.
 
 GROWTH is a least-squares fit of live bytes over time. The rise is the slope times the span after
 the first 20% of samples. It fails when that rise exceeds 64 KiB and 5% of the mean, or exceeds

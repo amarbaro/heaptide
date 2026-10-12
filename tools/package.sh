@@ -11,6 +11,7 @@ rm -rf "$stage"; mkdir -p "$stage/build/lib"
 cp "$here/heaptide" "$here/LICENSE" "$here/NOTICE" "$here/README.md" "$stage/"
 cp "$here/build/libheaptide.so" "$here/build/heaptide_report" "$stage/build/"
 cp -r "$here/py" "$stage/"  # --py runs py/run.py
+mkdir -p "$stage/report"; cp "$here/report/flame.html" "$stage/report/"  # heaptide flame's page
 ldd "$here/build/heaptide_report" | awk '/=> \// {print $3}' | grep -E '/modular/lib/' | while read -r lib; do
   cp -L "$lib" "$stage/build/lib/"
 done

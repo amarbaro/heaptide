@@ -226,7 +226,7 @@ done
 rm -rf "$w/c_snap"
 ./heaptide run --out "$w/c_snap" -- build/c_snapshot 2> "$w/c_snap.err" & p=$!
 waitfor 20 caught '^build/c_snapshot$' 15 || true; sleep 0.2  # a few blocks lost first
-./heaptide snapshot "$w/c_snap" 2>/dev/null; waitfor 20 grep -q "snapshot pid" "$w/c_snap.err" || true
+rc=0; ./heaptide snapshot "$w/c_snap" 2>/dev/null || rc=$?; expect c_snapshot snapshot_exit "$rc" 0  # returns once written: read at once
 read -r mid blk < <({ ./build/heaptide_report "$w/c_snap" --json 2>/dev/null || true; } | python3 -c "import json,sys; r=json.load(sys.stdin)[0]; print(r['direct'], r['leaks'][0]['blocks'])" 2>/dev/null || true)
 wait $p || true
 (( ${mid:-0} > 0 && ${mid:-0} < 40960 )) && ok "c_snapshot mid-run direct $mid" || bad c_snapshot "mid-run report direct '$mid', want 0 < x < 40960"
@@ -295,6 +295,15 @@ expect demo direct "$(sum demo direct)" 12800
 expect demo indirect "$(sum demo indirect)" 6400
 has demo "12.5 KiB (direct 12800, indirect 0, 100 blocks) cpu  handle_request demo.c:9:13"
 has demo "6.25 KiB (direct 0, indirect 6400, 100 blocks) cpu  handle_request demo.c:10:13"
+# heaptide flame / --folded: every stack, the same totals as the shim's own summary; the page's tree
+# logic (tests/flame_check.mjs) keeps them in every view
+fsum() { ./build/heaptide_report "$w/$1" --folded "$2" 2>/dev/null | awk '{ s += $NF } END { print s + 0 }'; }
+expect demo folded_leaked "$(fsum demo leaked)" "$(( $(sum demo direct) + $(sum demo indirect) ))"
+expect demo folded_live "$(fsum demo live)" "$(( $(sum demo live_cpu) + $(sum demo live_host) + $(sum demo live_mmap) + $(sum demo live_gpu) ))"
+./heaptide flame "$w/demo" -o "$w/demo.html" 2>/dev/null || true
+grep -q 'HEAPTIDE_DATA' "$w/demo.html" 2>/dev/null && bad flame "data not spliced into $w/demo.html" || ok "flame page written with its data"
+./build/heaptide_report "$w/demo" --flame-data > "$w/demo.flame.json" 2>/dev/null || true
+node tests/flame_check.mjs report/flame.html "$w/demo.flame.json" handle_request > "$w/demo.flame.txt" 2>&1 && ok "flame views keep totals (demo)" || bad flame "$(grep -m1 FAIL "$w/demo.flame.txt" || echo 'node failed') ($w/demo.flame.txt)"
 # --json is the agent interface: fields present, --supp filters the leak list like the totals
 j=$(./build/heaptide_report "$w/demo" --json 2>/dev/null || true)
 expect demo json "$(python3 -c 'import json,sys;d=json.loads(sys.argv[1])[0];l=d["leaks"][0];print(d["growth"],d["window_from_s"],l["direct"],l["indirect"],l["blocks"])' "$j" 2>&1)" "PASS 0 12800 0 100"
@@ -327,6 +336,14 @@ expect diff none_exit "$rc" 0
 HEAPTIDE_SYMBOLIZER=/nonexistent ./heaptide diff "$w/c_diff" "$w/c_diff_b" 2> "$w/diff_nosym.err" >/dev/null || true
 grep -q "warning: unnamed frames" "$w/diff_nosym.err" && ok "diff warns without names" || bad diff "no warning without llvm-symbolizer ($w/diff_nosym.err)"
 expect diff json "$(./heaptide diff "$w/c_diff" "$w/c_diff_b" --json 2>/dev/null | python3 -c 'import json,sys;print(sorted(c["group"] for c in json.load(sys.stdin)["changes"]))' 2>&1 || true)" "['GROWN', 'NEW']"
+# Qt's JavaScript heap lives in memfd mappings: a script's strings must not show as leaked in a
+# snapshot while it holds them (before memfd heaps were roots: 968,572 B direct). Needs Qt 6 qml6.
+if command -v qml6 >/dev/null; then  # Qt 6 runner (/usr/bin/qml can be Qt 5)
+  rm -rf "$w/qml_hold"  # a snapshot each second: the script holds its strings for 3 s
+  QT_QPA_PLATFORM=offscreen ./heaptide run --snapshot-every 1 --out "$w/qml_hold" -- qml6 -a core tests/qml_hold.qml > /dev/null 2> "$w/qml_hold.err" || true
+  qd=$(grep -m1 -oE "snapshot pid=[0-9]+ direct=[0-9]+" "$w/qml_hold.err" | grep -oE "[0-9]+$" || true)
+  (( ${qd:-99999} < 4096 )) && ok "qml_hold JS heap held, direct $qd B" || bad qml_hold "direct '${qd:-none}' B in a snapshot, want < 4096 ($w/qml_hold.err)"
+fi
 # heaptide attach: a process started without heaptide; leaks made after attach are reported, blocks
 # reachable only through memory from before attach are not; no ptrace permission: exit 2
 rm -rf "$w/c_attach"; build/c_attach > "$w/c_attach.pid" 2> "$w/c_attach.err" & p=$!
@@ -338,6 +355,8 @@ expect c_attach program_exit "$rc" 0
 ./build/heaptide_report "$w/c_attach" > "$w/c_attach.txt" 2>&1 || true
 has c_attach "cpu  lose_after c_attach.c:12"
 has c_attach "held by: memory from before attach"
+has c_attach "GROWTH  n/a (attached"
+expect c_attach json_growth "$(./build/heaptide_report "$w/c_attach" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["growth"])' || true)" attached
 sed -n '/^LEAKS/,/^GROWTH/p' "$w/c_attach.txt" | grep -q "c_attach.c:19" && bad c_attach "table entries reported as leaks ($w/c_attach.txt)" || ok "c_attach no false leak from before attach"
 sleep 30 & sp=$!; rc=0; ./heaptide attach $sp --out "$w/c_attach_denied" 2>/dev/null || rc=$?; kill $sp 2>/dev/null || true
 expect c_attach denied_exit "$rc" 2
@@ -346,14 +365,57 @@ cc -O0 -g -Wl,-z,relro,-z,now -o build/c_attach_now tests/c_attach.c
 build/c_attach_now > "$w/c_attach_now.pid" 2>/dev/null & p=$!
 waitfor 20 test -s "$w/c_attach_now.pid" || true; ap=$(head -1 "$w/c_attach_now.pid")
 ./heaptide attach "$ap" --out "$w/c_attach_now" 2>/dev/null || true
-off=$(readelf -rW build/c_attach_now | awk '/ malloc@/ {print $1; exit}')
-gp=""; base=""  # bash arithmetic, not gawk's strtonum (Ubuntu's awk is mawk)
-while read -r r perm _ _ _ path; do
-  [[ $path == */c_attach_now ]] || continue; lo=$((16#${r%-*})); hi=$((16#${r#*-})); base=${base:-$lo}
-  (( base + 16#$off >= lo && base + 16#$off < hi )) && gp=$perm
-done < /proc/$ap/maps || true
+# gotperm BIN PID: the permissions of the page holding BIN's GOT slot for malloc in process PID
+gotperm() { local off r perm path lo hi base="" gp=""  # bash arithmetic, not gawk's strtonum (Ubuntu's awk is mawk)
+  off=$(readelf -rW "$1" | awk '/ malloc@/ {print $1; exit}')
+  while read -r r perm _ _ _ path; do
+    [[ $path == */${1##*/} ]] || continue; lo=$((16#${r%-*})); hi=$((16#${r#*-})); base=${base:-$lo}
+    (( base + 16#$off >= lo && base + 16#$off < hi )) && gp=$perm
+  done < "/proc/$2/maps" || true; echo "$gp"; }
+gp=$(gotperm build/c_attach_now "$ap")
 wait $p || true
 expect c_attach got_page_after_attach "$gp" "r--p"
+# heaptide detach: a last snapshot, then the process runs on untracked. The program sees its malloc
+# GOT slot hold libc's again; the slot stays read-only (full RELRO); nothing after detach is
+# reported, and there is no report at its exit.
+cc -O0 -g -Wl,-z,relro,-z,now -o build/c_detach tests/c_detach.c -ldl
+rm -rf "$w/c_detach"; build/c_detach > "$w/c_detach.out" 2> "$w/c_detach.err" & p=$!
+waitfor 20 test -s "$w/c_detach.out" || true; dp=$(head -1 "$w/c_detach.out")
+./heaptide attach "$dp" --out "$w/c_detach" 2>/dev/null || true
+waitfor 20 grep -q leaked "$w/c_detach.out" || true
+rc=0; ./heaptide detach "$w/c_detach" 2> "$w/c_detach.detach" || rc=$?
+expect c_detach detach_exit "$rc" 0
+waitfor 20 grep -q detached "$w/c_detach.out" || true
+expect c_detach got_page_after_detach "$(gotperm build/c_detach "$dp")" "r--p"
+rc=0; ./heaptide attach "$dp" --out "$w/c_detach_again" 2>/dev/null || rc=$?  # inert copy loaded: refused, not a silent no-op
+expect c_detach reattach_exit "$rc" 2
+rc=0; wait $p || rc=$?
+expect c_detach program_exit "$rc" 0
+./build/heaptide_report "$w/c_detach" > "$w/c_detach.txt" 2>&1 || true
+has c_detach "cpu  lose_before c_detach.c:12"
+grep -q lose_after "$w/c_detach.txt" && bad c_detach "a leak after detach reported ($w/c_detach.txt)" || ok "c_detach nothing tracked after detach"
+expect c_detach exit_reports "$(grep -c '^heaptide: pid=' "$w/c_detach.err" || true)" 0
+# attached to a program that exports its own malloc, the hooks forward to that one (as the dynamic
+# linker bound it), not libc's: a block from before attach then reaches the free that matches it
+cc -O0 -g -rdynamic -o build/c_ownmalloc tests/c_ownmalloc.c -ldl
+rm -rf "$w/c_ownmalloc"; build/c_ownmalloc > "$w/c_ownmalloc.out" 2> "$w/c_ownmalloc.err" & p=$!
+waitfor 20 test -s "$w/c_ownmalloc.out" || true
+./heaptide attach "$(head -1 "$w/c_ownmalloc.out")" --out "$w/c_ownmalloc" 2>/dev/null || true
+rc=0; wait $p || rc=$?
+expect c_ownmalloc program_exit "$rc" 0
+./build/heaptide_report "$w/c_ownmalloc" > "$w/c_ownmalloc.txt" 2>&1 || true
+has c_ownmalloc "cpu  strdup"
+# an allocator that maps memory under its own lock (PartitionAlloc does): a thread's first unwind
+# in the mmap hook must not allocate (libunwind's TLS block, its key block) through that allocator,
+# or the thread sleeps on its own lock (Vivaldi hung minutes after attach). Exit 7 = re-entered.
+cc -O0 -g -rdynamic -o build/c_ownlock tests/c_ownlock.c -ldl -lpthread
+rm -rf "$w/c_ownlock"; build/c_ownlock attach > "$w/c_ownlock.out" 2> "$w/c_ownlock.err" & p=$!
+waitfor 20 test -s "$w/c_ownlock.out" || true
+./heaptide attach "$(head -1 "$w/c_ownlock.out")" --out "$w/c_ownlock" 2>/dev/null || true
+rc=0; wait $p || rc=$?
+expect c_ownlock attach_exit "$rc" 0
+rc=0; timeout 60 ./heaptide run --out "$w/c_ownlock_run" -- build/c_ownlock > /dev/null 2> "$w/c_ownlock_run.err" || rc=$?
+expect c_ownlock run_exit "$rc" 0
 # symbolizer lookup: none found -> modules only, never a crash; one on PATH wins over ROCm's
 HEAPTIDE_SYMBOLIZER=/nonexistent ./build/heaptide_report "$w/demo" --top 1 > "$w/nosym.txt" 2>&1 || true
 has nosym "sites show modules only"
@@ -380,6 +442,11 @@ if python3 -c "import numpy" 2>/dev/null; then
   run py_leak --py -- python3 tests/py_leak.py
   has py_leak "py_leak.py:6"
   has py_leak "py_leak.py:7"
+  # one site per line (two bytecode offsets on line 6 are one row); numpy's array data reaches line 7
+  # through PyTraceMalloc_Track (50 x 80 KiB)
+  expect py_leak line6_rows "$(sed -n '/^PYTHON/,$p' "$w/py_leak.txt" | grep -c 'py_leak.py:6$' || true)" 1
+  b7=$(sed -n '/^PYTHON/,$p' "$w/py_leak.txt" | awk '/py_leak.py:7$/ {print $1; exit}')
+  (( ${b7:-0} >= 4096000 )) && ok "py_leak numpy data on line 7 ($b7 B)" || bad py_leak "line 7 holds '${b7:-none}' B, want >= 4096000 ($w/py_leak.txt)"
   # numpy's native frames; stripped libpython and numpy resolve to source through debuginfod
   # (symbolized or not depends on the machine's debug info, so either form passes)
   grep -qE "PyArray_NewFromDescr|_multiarray_umath" "$w/py_leak.txt" && ok "py_leak shows numpy's frames" || bad py_leak "no numpy frame ($w/py_leak.txt)"
@@ -391,6 +458,8 @@ if python3 -c "import numpy" 2>/dev/null; then
   # name the Python function that made them (CPython's perf trampoline, -X perf, Python >= 3.12)
   run py_mixed --py -- python3 tests/py_mixed.py
   grep -qE "cpu  .*<- py::leak_in_native py_mixed.py" "$w/py_mixed.txt" && ok "py_mixed native site names py::leak_in_native" || bad py_mixed "no py frame on a cpu site ($w/py_mixed.txt)"
+  ./build/heaptide_report "$w/py_mixed" --flame-data > "$w/py_mixed.flame.json" 2>/dev/null || true
+  node tests/flame_check.mjs report/flame.html "$w/py_mixed.flame.json" py::leak_in_native > "$w/py_mixed.flame.txt" 2>&1 && ok "flame views keep totals, py:: frames (py_mixed)" || bad flame "$(grep -m1 FAIL "$w/py_mixed.flame.txt" || echo 'node failed') ($w/py_mixed.flame.txt)"
   run py_gpu --py -- python3 tests/py_gpu.py "$here/build/tl/libamdhip64.so"
   expect py_gpu live_gpu "$(sum py_gpu live_gpu)" 1048576
   grep -qE "gpu  .*<- py::load_weights py_gpu.py" "$w/py_gpu.txt" && ok "py_gpu GPU site names py::load_weights" || bad py_gpu "no py frame on a gpu site ($w/py_gpu.txt)"

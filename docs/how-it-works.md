@@ -255,7 +255,9 @@ leaking stacks, all of them so totals and `--supp` cover every site, and the top
 `llvm-symbolizer --no-inlines` in one batch. A module without `.debug_info` is swapped for its
 debug file by build-id: from elfutils' cache (`~/.cache/debuginfod_client/<id>/debuginfo`, shared
 with gdb), or fetched with curl from the first `DEBUGINFOD_URLS` server and cached there. ROCm's
-llvm-symbolizer is built without debuginfod, so the report does this itself. A site is the first
+llvm-symbolizer is built without debuginfod, so the report does this itself, and runs the symbolizer with
+`DEBUGINFOD_URLS` unset: a symbolizer that has debuginfod asked the server again for every module without debug info on
+every run (a ROCm program: 90 s of network waits for 0.2 s of work). A site is the first
 two frames plus the first frame in the user's own source: a path outside `/usr`, `/opt` and
 `.venv`, or, without debug info, a frame in the executable.
 

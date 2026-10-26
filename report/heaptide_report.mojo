@@ -10,7 +10,9 @@ from std.ffi import external_call
 
 comptime ROW = 56
 # $HEAPTIDE_SYMBOLIZER, else llvm-symbolizer on PATH, else ROCm's copy; exit 3 when none runs
-comptime FIND_SYMBOLIZER = "S=${HEAPTIDE_SYMBOLIZER:-$(command -v llvm-symbolizer || echo /opt/rocm/llvm/bin/llvm-symbolizer)}; [ -x \"$S\" ] || exit 3; \"$S\""
+# env -u DEBUGINFOD_URLS: the DEBUGINFOD step below already fetched what the server has (and remembers what it has not for 7
+# days); with the variable set llvm-symbolizer asked the server again for every module without debug info on every run (90 s)
+comptime FIND_SYMBOLIZER = "S=${HEAPTIDE_SYMBOLIZER:-$(command -v llvm-symbolizer || echo /opt/rocm/llvm/bin/llvm-symbolizer)}; [ -x \"$S\" ] || exit 3; env -u DEBUGINFOD_URLS \"$S\""
 # Stripped modules: swap in the debug file from elfutils' cache (shared with gdb), fetched by
 # build-id from $DEBUGINFOD_URLS when missing. Reads the request file $I in place.
 comptime DEBUGINFOD = """c=${XDG_CACHE_HOME:-$HOME/.cache}/debuginfod_client

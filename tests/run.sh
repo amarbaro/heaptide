@@ -362,6 +362,11 @@ print(len(s) > 0, sum("KGEN" in x and all(rt.match(f) for f in x.split(" <- ")) 
 strip -o build/c_leak_stripped build/c_leak; rm -rf "$w/dinfo" "$w/dcache"; ./heaptide run --out "$w/dinfo" -- build/c_leak_stripped 2>/dev/null || true
 dn() { XDG_CACHE_HOME="$PWD/$w/dcache" DEBUGINFOD_URLS=http://127.0.0.1:9 ./build/heaptide_report "$w/dinfo" --fail-on none 2>&1 >/dev/null | grep -c "no debug file for .*c_leak_stripped" || true; }
 expect debuginfod notes_first_second "$(dn) $(dn)" "1 0"
+# the symbolizer is not given DEBUGINFOD_URLS: the report fetched what the server has itself, and with the variable set
+# llvm-symbolizer asked again for every module on every run (90 s on a ROCm program)
+printf '#!/bin/sh\nprintf "%%s" "${DEBUGINFOD_URLS-unset}" > %s\nexec llvm-symbolizer "$@"\n' "$PWD/$w/fakesym.env" > "$w/fakesym"; chmod +x "$w/fakesym"
+HEAPTIDE_SYMBOLIZER="$PWD/$w/fakesym" DEBUGINFOD_URLS=http://127.0.0.1:9 XDG_CACHE_HOME="$PWD/$w/dcache" ./build/heaptide_report "$w/c_leak" --fail-on none >/dev/null 2>&1 || true
+expect symbolizer env_DEBUGINFOD_URLS "$(cat "$w/fakesym.env" 2>/dev/null)" unset
 # heaptide diff: a new leak site fails (exit 1), a grown peak is listed, a moved line is the same site
 cc -O0 -g -DEXTRA -o build/c_diff_b tests/c_diff.c 2>/dev/null
 run c_diff -- build/c_diff

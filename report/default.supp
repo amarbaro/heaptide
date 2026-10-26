@@ -1,0 +1,7 @@
+# The default suppression list of `heaptide report` (--no-default-supp turns it off, --supp FILE adds yours).
+# ROCm/HSA/HIP allocations made once at startup and never freed, seen as leaks in every --gpu report (kinestride, ROCm 7.2).
+# One entry per line: frames joined by " <- ", leaf first. Each frame is a substring of a function name, and the frames must
+# appear in that order along the call chain, so an entry names the runtime caller too and never matches a program's own
+# leak that merely ends in the same libc call (a user's setenv() is not rocprofiler-register's).
+rocr::AMD::AqlQueue::AqlQueue
+__add_to_environ <- rocprofiler_register::

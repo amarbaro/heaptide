@@ -16,7 +16,7 @@ heaptide diff BASE NEW [--fail-on new|grown|none] [--json] [--top N]   exit 1 on
 heaptide attach PID [--out DIR]                        a running process, no restart (gdb; sudo under Yama 1)
 heaptide detach DIR                                    a last snapshot, then the process runs on untracked
 heaptide flame DIR [-o OUT.html] [--open]              every call path as an interactive flame graph, one offline page
-heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none]
+heaptide report DIR [--json] [--top N] [--supp FILE] [--no-default-supp] [--fail-on any|leaks|growth|none]
                     [--growth-limit MIB] [--folded leaked|live|peak|allocated|temporaries]
 ```
 
@@ -134,7 +134,14 @@ GPU targets need ROCm/HIP. Python mode hooks CPython's own allocators (no `trace
   the signal; best effort, since the heap may be broken (it gives up after 10 s).
 - `report --growth-limit MIB` fails GROWTH on a projected rise above MIB, whatever the mean.
 - `report --supp FILE` drops leaks whose site contains any line of FILE (built in: glibc's
-  `_dlerror_run` buffer, which libc releases at exit behind malloc's back). `--json` prints one
+  `_dlerror_run` buffer, which libc releases at exit behind malloc's back).
+  The default runtime list `report/default.supp` also drops the ROCm runtime's one-time allocations
+  (an `AqlQueue` ring, `setenv()` strings from `rocprofiler_register`) and says so in one line,
+  `suppressed 119 B in 3 blocks by the default runtime list` (`--json`: `suppressed_bytes`, `suppressed_blocks`);
+  `--no-default-supp` shows them again. An entry is a call chain, frames joined by `<-`, leaf first, each a
+  substring of a function name in that order, so a program's own `setenv()` or a callback run from a HIP call is
+  still reported. The file is found through `HEAPTIDE_DEFAULT_SUPP` (the `heaptide` wrapper sets it) or next to
+  the binary at `../report/`; missing, it is a note and the runtime allocations show as leaks. `--json` prints one
   object per process. A damaged `.bin`, a missing option value or an unknown option is exit 2.
 - Exit code: 0 clean, 1 leak or growth (per `--fail-on`), 2 tool error.
 

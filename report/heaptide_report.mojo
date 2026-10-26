@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 AMARBARO · amarbaro.org labs
-# heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none] [--growth-limit MIB]
+# heaptide report DIR [--json] [--top N] [--supp FILE] [--no-default-supp] [--fail-on any|leaks|growth|none] [--growth-limit MIB]
 # Reads DIR/heaptide.<pid>.{bin,maps} (+ py.<pid>.txt), symbolizes the reported stacks in one
 # llvm-symbolizer batch, prints LEAKS / GROWTH / PEAK / HOTSPOTS / TEMPORARIES / PYTHON.
 # Exit 0 clean, 1 leak or growth (per --fail-on), 2 tool error.
@@ -97,6 +97,44 @@ def load_maps(text: String) raises -> List[Mapping]:
         if not found:
             out.append(Mapping(s, e, p))
     return out^
+
+
+def load_default_supp(exe: String) -> List[List[String]]:
+    """The default suppression list (report/default.supp): ROCm/HSA/HIP one-time allocations. One entry per line, frames
+    joined by " <- " (leaf first), each a substring of a frame's function, in that order along the call chain; `#` comments.
+    Found through $HEAPTIDE_DEFAULT_SUPP (the heaptide wrapper sets it), else next to this binary at ../report/."""
+    var out = List[List[String]]()
+    var path = getenv("HEAPTIDE_DEFAULT_SUPP", "")
+    if path.byte_length() == 0 and exe.rfind("/") > 0:
+        path = String(exe[byte=: exe.rfind("/")], "/../report/default.supp")
+    try:
+        with open(path, "r") as f:
+            for l in f.read().split("\n"):
+                var t = String(l.strip())
+                if t.byte_length() == 0 or t.startswith("#"):
+                    continue
+                var pat = List[String]()
+                for part in t.split(" <- "):
+                    pat.append(String(part.strip()))
+                out.append(pat^)
+    except:
+        print("note: default runtime suppression list not found (", path, "): the ROCm runtime's one-time allocations show as leaks", file=stderr)
+    return out^
+
+
+def chain_matches(chain: String, pat: List[String]) -> Bool:
+    var frames = chain.split(" <- ")
+    var at = 0
+    for p in pat:
+        var found = False
+        while at < len(frames):
+            at += 1
+            if p in String(frames[at - 1]):
+                found = True
+                break
+        if not found:
+            return False
+    return True
 
 
 def residue(site: String) -> Bool:
@@ -328,8 +366,9 @@ def resolve_frames(ips: List[UInt64], roots: List[UInt64], maps: List[Mapping], 
     return frames^
 
 
-def symbolize(stacks: List[Stack], wanted: List[Int], roots: List[UInt64], maps: List[Mapping], dir: String, pid: String) raises -> Dict[Int, String]:
-    # site per stack index: first 2 frames outside libheaptide + first frame in the user's own source
+def symbolize(stacks: List[Stack], wanted: List[Int], roots: List[UInt64], maps: List[Mapping], dir: String, pid: String, mut chains: Dict[Int, String]) raises -> Dict[Int, String]:
+    # site per stack index: first 2 frames outside libheaptide + first frame in the user's own source;
+    # chains: every frame's function, for the default suppression list
     var idx = Dict[UInt64, Int]()  # each address once in the batch (a frame shared by many stacks was asked many times)
     var uniq = List[UInt64]()
     for w in wanted:
@@ -341,6 +380,12 @@ def symbolize(stacks: List[Stack], wanted: List[Int], roots: List[UInt64], maps:
     var frames = resolve_frames(uniq, roots, maps, dir, pid, root_names)
     var sites = Dict[Int, String]()
     for w in wanted:
+        var c = String()
+        for ip in stacks[w].ips:
+            ref f = frames[idx[ip]]
+            if f.shown:
+                c += (" <- " if c.byte_length() > 0 else "") + f.func
+        chains[w] = c^
         var n = 0  # frames shown; 100 + n once a user frame is in
         for ip in stacks[w].ips:
             ref f = frames[idx[ip]]
@@ -708,7 +753,7 @@ def main() raises:
             exit(2)
         exit(diff(String(args[2]), String(args[3]), fo, js))
     if len(args) < 2:
-        print("usage: heaptide report DIR [--json] [--top N] [--supp FILE] [--fail-on any|leaks|growth|none] [--growth-limit MIB]", file=stderr)
+        print("usage: heaptide report DIR [--json] [--top N] [--supp FILE] [--no-default-supp] [--fail-on any|leaks|growth|none] [--growth-limit MIB]", file=stderr)
         exit(2)
     var dir = String(args[1])
     var as_json = False
@@ -721,9 +766,14 @@ def main() raises:
     var flames = List[String]()
     # glibc's dlerror buffer: freed by libc at exit without passing through malloc's hooks
     var supp: List[String] = ["_dlerror_run"]
+    var use_default = True  # report/default.supp; --no-default-supp turns it off
     var i = 2
     while i < len(args):
         var flag = String(args[i])
+        if flag == "--no-default-supp":
+            use_default = False
+            i += 1
+            continue
         if flag == "--json" or flag == "--flame-data":
             as_json = as_json or flag == "--json"
             flame_data = flame_data or flag == "--flame-data"
@@ -770,6 +820,7 @@ def main() raises:
             exit(2)
         i += 2
 
+    var default_supp = load_default_supp(String(args[0])) if use_default else List[List[String]]()
     var bad = False
     var nbin = 0
     var quiet = List[String]()
@@ -914,7 +965,8 @@ def main() raises:
                             wanted.append(Int(p[1]) - 1)
         except:
             pass
-        var sites = symbolize(stacks, wanted, roots, maps, dir, pid)
+        var chains = Dict[Int, String]()
+        var sites = symbolize(stacks, wanted, roots, maps, dir, pid, chains)
         for i in range(len(py_held)):  # a GPU block's site, symbolized like the others
             if py_held[i][0] == "gpu":
                 py_held[i][1] = sites.get(Int(py_held[i][1]) - 1, String("?")) if py_held[i][1].is_ascii_digit() else String("?")
@@ -935,12 +987,21 @@ def main() raises:
         var leak_i: UInt64 = 0
         var leak_lines = List[String]()
         var kept = List[Int]()
+        var sup_b: UInt64 = 0  # dropped by the default list
+        var sup_n: UInt64 = 0
         for w in sections[0]:
             var site = sites.get(w, String("?"))
             var skip = residue(site)
             for p in supp:
                 if p in site:
                     skip = True
+            if not skip:
+                for pat in default_supp:
+                    if chain_matches(chains.get(w, String()), pat):
+                        sup_b += stacks[w].direct + stacks[w].indirect
+                        sup_n += stacks[w].leaked_n
+                        skip = True
+                        break
             if not skip:
                 kept.append(w)
                 leak_d += stacks[w].direct
@@ -984,7 +1045,7 @@ def main() raises:
         if as_json:
             if json.byte_length() > 1:
                 json += ","
-            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"growth":"', verdict,
+            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"suppressed_bytes":', sup_b, ',"suppressed_blocks":', sup_n, ',"growth":"', verdict,
                            '","growth_bytes_per_s":', Int(slope), ',"growth_window_bytes":', Int(max(grow, 0.0)),
                            ',"window_from_s":', steady if steady.byte_length() > 0 else String("0"), ',"leaks":[')
             var first = True
@@ -1029,6 +1090,8 @@ def main() raises:
         if cmdline.byte_length() > 0:
             print("   cmd", cmdline)
         print("LEAKS  direct", human(leak_d), " indirect", human(leak_i))
+        if sup_n > 0:
+            print("  suppressed", human(sup_b), "in", sup_n, "blocks by the default runtime list")
         for l in leak_lines:
             print(l)
         if attached:

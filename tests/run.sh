@@ -362,6 +362,24 @@ print(len(s) > 0, sum("KGEN" in x and all(rt.match(f) for f in x.split(" <- ")) 
 strip -o build/c_leak_stripped build/c_leak; rm -rf "$w/dinfo" "$w/dcache"; ./heaptide run --out "$w/dinfo" -- build/c_leak_stripped 2>/dev/null || true
 dn() { XDG_CACHE_HOME="$PWD/$w/dcache" DEBUGINFOD_URLS=http://127.0.0.1:9 ./build/heaptide_report "$w/dinfo" --fail-on none 2>&1 >/dev/null | grep -c "no debug file for .*c_leak_stripped" || true; }
 expect debuginfod notes_first_second "$(dn) $(dn)" "1 0"
+# the default runtime list (report/default.supp): the ROCm runtime's one-time allocations are dropped and counted in one line;
+# a leak of the program's own is not, even through a function named like a HIP API call, and not a setenv() of its own
+c++ -O0 -g -o build/cpp_rocr tests/cpp_rocr.cpp
+run cpp_rocr -- build/cpp_rocr
+leaks() { grep -E '^  [0-9.]+ [A-Za-z]+ \(direct' "$1" || true; }  # the LEAKS lines of a report
+has cpp_rocr "by the default runtime list"
+expect cpp_rocr suppressed_blocks "$(grep -m1 -oE 'suppressed .* in [0-9]+ blocks' "$w/cpp_rocr.txt" | grep -oE '[0-9]+ blocks' | cut -d' ' -f1)" 3
+expect cpp_rocr leak_lines "$(leaks "$w/cpp_rocr.txt" | wc -l)" 2
+expect cpp_rocr runtime_gone "$(leaks "$w/cpp_rocr.txt" | grep -cE 'AqlQueue|rocprofiler_register' || true)" 0
+expect cpp_rocr own_leaks_stay "$(leaks "$w/cpp_rocr.txt" | grep -cE 'user_cb\(void\*\) cpp_rocr.cpp|__add_to_environ\(unsigned long\) cpp_rocr.cpp' || true)" 2
+./build/heaptide_report "$w/cpp_rocr" --no-default-supp --fail-on none > "$w/cpp_rocr_all.txt" 2>&1 || true
+expect cpp_rocr_all leak_lines "$(leaks "$w/cpp_rocr_all.txt" | wc -l)" 5  # the three runtime blocks are back beside the two of the program
+expect cpp_rocr_all no_suppressed_line "$(grep -c 'by the default runtime list' "$w/cpp_rocr_all.txt" || true)" 0
+expect cpp_rocr json "$(./build/heaptide_report "$w/cpp_rocr" --json --fail-on none 2>/dev/null | python3 -c 'import json,sys;d=json.load(sys.stdin)[0];print(d["suppressed_blocks"],d["suppressed_bytes"],d["direct"],len(d["leaks"]))' 2>&1)" "3 119 808 2"
+# the wrapper finds the list through HEAPTIDE_DEFAULT_SUPP; a missing file is a note, never a failure
+HEAPTIDE_DEFAULT_SUPP=/nonexistent ./build/heaptide_report "$w/cpp_rocr" --fail-on none > "$w/cpp_rocr_nolist.txt" 2>&1 || true
+has cpp_rocr_nolist "default runtime suppression list not found"
+expect cpp_rocr_nolist leak_lines "$(leaks "$w/cpp_rocr_nolist.txt" | wc -l)" 5
 # the symbolizer is not given DEBUGINFOD_URLS: the report fetched what the server has itself, and with the variable set
 # llvm-symbolizer asked again for every module on every run (90 s on a ROCm program)
 printf '#!/bin/sh\nprintf "%%s" "${DEBUGINFOD_URLS-unset}" > %s\nexec llvm-symbolizer "$@"\n' "$PWD/$w/fakesym.env" > "$w/fakesym"; chmod +x "$w/fakesym"

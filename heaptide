@@ -3,7 +3,7 @@
 # Copyright 2026 AMARBARO · amarbaro.org labs
 # heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline all|sites,streams,frag]
 #              [--no-children | --only NAME[,NAME]] [--out DIR] -- CMD...
-# heaptide report DIR [args]   |   heaptide snapshot DIR [--label NAME] (every running process writes a report now; NAME keeps them in DIR/NAME)
+# heaptide report DIR [args]  (--supp FILE, --no-default-supp: report/default.supp drops the ROCm runtime's one-time allocations)   |   heaptide snapshot DIR [--label NAME] (every running process writes a report now; NAME keeps them in DIR/NAME)
 # heaptide attach PID [--out DIR]   (a running process: gdb loads heaptide into it; root under Yama 1)
 # heaptide detach DIR   (a last snapshot, then the process runs on untracked: no restart)
 # heaptide flame DIR [-o OUT.html] [--open]   (an interactive flame graph, one offline HTML file)
@@ -11,7 +11,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 case "${1:-}" in
-  report) shift; exec "$here/build/heaptide_report" "$@" ;;
+  report) shift; HEAPTIDE_DEFAULT_SUPP=${HEAPTIDE_DEFAULT_SUPP:-$here/report/default.supp} exec "$here/build/heaptide_report" "$@" ;;
   snapshot) [[ -d ${2:-} && ( -z ${3:-} || ( $3 == --label && ${4:-} =~ ^[A-Za-z0-9._-]+$ ) ) ]] ||
               { echo "FAIL heaptide: snapshot DIR [--label NAME]   (DIR: the run's --out; NAME: letters, digits, . _ -)" >&2; exit 2; }
             # every traced process answers the new mtime; this returns once the root's report (any, if the

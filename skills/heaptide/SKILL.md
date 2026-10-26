@@ -75,12 +75,13 @@ Exit codes: `report` returns 0 clean, 1 leak or growth (per `--fail-on any|leaks
 | `kind: gpu` or `host` unfreed | device or pinned buffer never freed | always real: GPU blocks are never treated as reachable |
 | `kind: mmap` | an anonymous mapping never unmapped, or a part of a `PROT_NONE` reservation that `mprotect` committed (site = the `mprotect` call) | real unless it is an arena the runtime keeps by design |
 | a few hundred B in `hsa_amd_signal_create`, `amd::roc::Device`, `_dl_*` | HIP/Mojo runtime residue | suppress, do not "fix" |
+| `suppressed N B in K blocks by the default runtime list` under LEAKS | the ROCm runtime's one-time allocations (`AqlQueue`, `rocprofiler_register` setenv), already dropped from the totals by `report/default.supp` | nothing; `--no-default-supp` lists them. Report a site that looks like runtime residue but is not in the list by adding a chain line to a `--supp` file |
 | GROWTH FAIL, few direct leaks | memory held, not lost: caches, queues, pools that keep growing | read `held` (`held by:` under PEAK): it names the holder chain, from the site to a global, a thread's stack, or memory from before attach. Holders are recorded for memory live at the report: for a service, `heaptide snapshot` while it grows |
 | GROWTH `too short` | fewer than 5 samples | run longer or lower `--every` |
 | GROWTH `n/a` (JSON `attached`) | attached: live bytes count from 0 at attach, so their ramp is not growth | `heaptide snapshot` twice while it runs, then `heaptide diff A B` |
 
-Suppress with `--supp FILE` (one substring of a site per line). Keep the file next to the test that
-uses it and say in a comment why each line is residue.
+The ROCm runtime's own one-time blocks are already suppressed by default (`report/default.supp`, named in one line under LEAKS). For anything else suppress with `--supp FILE` (one substring of a site per line). Keep the file next to the test that
+uses it and say in a comment why each line is residue. A site that a program's own call can also produce (`setenv`, `strdup`) must not be suppressed by its two-frame site alone.
 
 ## GROWTH, read it right
 

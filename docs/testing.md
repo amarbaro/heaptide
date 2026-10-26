@@ -1,13 +1,13 @@
 # Testing
 
-`tests/run.sh` builds everything and runs 187 checks against programs with planted bugs. Where a
+`tests/run.sh` builds everything and runs 216 checks against programs with planted bugs. Where a
 standard tool can answer the same question, its answer is the oracle: heaptrack for leaked
 allocation counts, LeakSanitizer (`clang -fsanitize=leak`) for the direct/indirect split and
 reachability. The script prints `PASS N/N`, or `FAIL k/N <names>` and exits non-zero.
 
 ```
-tests/run.sh                    # everything, GPU included: PASS 187/187
-tests/run.sh --cpu              # CPU checks only: PASS 182/182 (cpu only: GPU checks not run)
+tests/run.sh                    # everything, GPU included: PASS 216/216
+tests/run.sh --cpu              # CPU checks only: PASS 211/211 (cpu only: GPU checks not run)
 HEAPTIDE_NO_GPU=1 tests/run.sh  # GPU checks skipped and counted as FAIL
 taskset -c 0 tests/run.sh --cpu # one CPU: the signal and snapshot checks poll, never sleep-guess
 tools/ci-local.sh               # .github/workflows/cpu.yml's steps in ubuntu:24.04, on HEAD: run before a push
@@ -57,6 +57,8 @@ older CPU (it caught a report built for the build machine's CPU) and under WSL2 
 | `c_sleep.c` | holds 1 MiB from `keep()` in a local, sleeps 2 s, exits 1 if the sleep was cut short | a snapshot during the sleep leaves it intact (exit 0; the v0.1.3 shim: exit 1) and shows `held by: a thread's stack` |
 | `hip_tl.c` | mock `libamdhip64` (each allocation keeps 1 MiB more on the device); a site grows 4, 8, 12 MiB 300 ms apart, two streams, one freed | `--gpu-timeline all`: the three steps, two `[stream` rows, the device line ends at 7 MiB; `sites` alone has no stream or device row; off: no section; a bad part exits 2. On the GPU, `hip_leak` with `all` shows the section |
 | `c_diff.c` | base: 10 x 1000 B lost at `lose_a`, a 1 MiB peak at `buffer`; `-DEXTRA`: also 10 x 500 B at `lose_b`, a 4 MiB peak, `lose_a` one line lower | `heaptide diff`: NEW `lose_b`, GROWN `buffer` 1.0 -> 4.0 MiB, `lose_a` not listed, exit 1; a run against itself prints nothing, exit 0; `--fail-on none` exit 0; `--json` groups |
+| `cpp_rocr.cpp` | three blocks shaped like the ROCm runtime's one-time allocations (an `AqlQueue` ring, two lost in `__add_to_environ` under `rocprofiler_register`), plus a malloc in a callback run by a function named `hipLaunchHostFunc` and a program-side `__add_to_environ` | the default list drops the 3 (`suppressed ... in 3 blocks`, JSON `suppressed_blocks` 3), the 2 stay; `--no-default-supp` or a missing list file brings all 5 back |
+| symbolizer env | a stand-in `llvm-symbolizer` that records its environment, run with `DEBUGINFOD_URLS` set | it never sees the variable (the report fetched debug files itself; with it set a ROCm report waited 90 s) |
 | `c_attach.c` | started without heaptide, allows ptrace (`PR_SET_PTRACER_ANY`); once attached: 20 x 256 B into a table reachable only through a block from before attach, 20 x 1000 B lost at `lose_after` | `heaptide attach` exits 0, the program exits 0; leaks at `lose_after`; `GROWTH  n/a (attached` and JSON `"growth":"attached"`, the table entries `held by: memory from before attach` and not in LEAKS (without the pre-attach roots: 24120 B direct); attach to a process that does not allow ptrace: exit 2 with the Yama hint; built `-z relro,-z now`: the page holding `malloc`'s GOT slot is `r--p` again after attach |
 | `c_detach.c` | started without heaptide; once its own `malloc` GOT slot is heaptide's: 20 x 1000 B lost at `lose_before`; once the slot holds libc's `malloc` again: 20 x 1000 B lost at `lose_after`. Built `-z relro,-z now` | `heaptide detach` exits 0, the program exits 0 (it saw its slot return to libc); the GOT page is `r--p` after detach; `lose_before` in LEAKS, `lose_after` nowhere; no report at its exit |
 | `c_ownmalloc.c` | exports its own `malloc`/`free` (tagged header over libc; `free` aborts on an untagged block), as Chromium and jemalloc builds do; 200 blocks from before attach freed after it, 200 `strdup` calls after it | attached, the program exits 0 (before the fix: `BAD FREE`, abort); `strdup` sites reported |

@@ -25,7 +25,7 @@ waitfor() { local i; for ((i = 0; i < $1 * 20; i++)); do "${@:2}" && return 0; s
 caught() { local p m; p=$(pgrep -nf -- "$1") || return 1; m=$(awk '/^SigCgt/ {print $2}' "/proc/$p/status" 2>/dev/null) || return 1
            (( (16#${m:-0} >> ($2 - 1)) & 1 )); }
 
-for t in c_leak c_reach c_churn c_grow c_flat c_setup c_mmap c_slow c_fork c_interior c_realloc c_peak c_reserve c_signal c_snapshot c_remap c_crash c_steady c_forkmt c_rtsig c_cache c_sleep c_diff c_attach; do cc -O0 -g -o "build/$t" "tests/$t.c"; done
+for t in c_leak c_reach c_churn c_grow c_flat c_setup c_mmap c_slow c_fork c_interior c_realloc c_peak c_reserve c_signal c_snapshot c_remap c_crash c_steady c_forkmt c_rtsig c_cache c_sleep c_diff c_attach c_binptr; do cc -O0 -g -o "build/$t" "tests/$t.c"; done
 
 run c_leak -- build/c_leak
 expect c_leak direct "$(sum c_leak direct)" 100005
@@ -33,6 +33,8 @@ ht=$(timeout 60 heaptrack --record-only -o "$PWD/$w/ht" build/c_leak 2>&1 | grep
 expect c_leak heaptrack_leaked_allocs "$ht" 101
 has c_leak "lose c_leak.c:3"
 
+run c_binptr -- build/c_binptr  # glibc's bins point into the 40 B block's tail: still lost
+expect c_binptr direct "$(sum c_binptr direct)" 40
 run c_reach -- build/c_reach
 expect c_reach direct "$(sum c_reach direct)" 128
 expect c_reach indirect "$(sum c_reach indirect)" 256
@@ -55,6 +57,22 @@ expect c_flat direct "$(sum c_flat direct)" 0
 # under 1 MiB each (normal: <= 128 KiB; a shim leaking 64 B per 1024 mallocs grows ~21 MiB)
 g=$(./heaptide run --out "$w/c_steady" -- build/c_steady 2>/dev/null | grep -oE '[0-9-]+ [0-9-]+$' || true)
 [[ $g =~ ^-?[0-9]+\ -?[0-9]+$ ]] && (( ${g% *} < 1024 && ${g#* } < 1024 )) && ok "c_steady shim growth $g KiB" || bad c_steady "shim growth '$g' KiB, want both < 1024"
+# which process is which: every report object names its command and the root; children drop out on request
+# (bash, not sh: Ubuntu's sh is dash, which leaves through _exit and so writes no report)
+rm -rf "$w/proc_all" "$w/proc_nc" "$w/proc_only"
+./heaptide run --out "$w/proc_all" -- bash -c 'true; ls >/dev/null; true' 2>/dev/null
+expect proc_all root "$(./build/heaptide_report "$w/proc_all" --json --fail-on none 2>/dev/null | python3 -c 'import json,sys
+print(";".join(x["cmdline"] + ("*" if x["root"] else "") for x in sorted(json.load(sys.stdin), key=lambda x: -x["root"])))' 2>&1)" "bash -c true; ls >/dev/null; true*;ls"
+./heaptide run --no-children --out "$w/proc_nc" -- bash -c 'true; ls >/dev/null; true' 2>/dev/null
+expect proc_nc files "$(ls "$w/proc_nc" | grep -c '\.bin$')" 1
+./heaptide run --only ls,cat --out "$w/proc_only" -- bash -c 'true; ls >/dev/null; true' 2>/dev/null
+expect proc_only root "$(./build/heaptide_report "$w/proc_only" --json --fail-on none 2>/dev/null | python3 -c 'import json,sys
+print(";".join(x["exe"] + ("*" if x["root"] else "") for x in json.load(sys.stdin)))' 2>&1)" "/usr/bin/ls*"
+# per-process RSS floor: under THP "always" each arena's first touch was a 2 MiB page (sleep: +7.2 MB)
+sleep 3 & b=$!; HEAPTIDE_OUT="$PWD/$w" LD_PRELOAD="$PWD/build/libheaptide.so" sleep 3 2>/dev/null & h=$!
+waitfor 10 grep -qE 'SigCgt:.*[1-9a-f]' "/proc/$h/status" || true  # the shim's handlers: it is initialised
+d=$(( $(awk '/^VmRSS/ {print $2}' /proc/$h/status) - $(awk '/^VmRSS/ {print $2}' /proc/$b/status) )); kill $b $h; wait $b $h 2>/dev/null || true
+(( d < 2048 )) && ok "rss_floor +$d kB per process" || bad rss_floor "+$d kB over bare sleep, want < 2048"
 run c_setup --every 20 -- build/c_setup
 has c_setup "GROWTH  PASS"
 # --growth-limit: a slow leak under the 5% rule fails once an absolute limit is set; a setup that
@@ -188,6 +206,13 @@ tlj=$({ ./build/heaptide_report "$w/hip_tl" --json 2>/dev/null || true; } | pyth
 d={x["site"].split(" ")[0]:[p[1] for p in x["points"]] for x in json.load(sys.stdin)[0]["gpu_timeline"]}
 print(d["grow"], d["(device:"][-1])' 2>&1)
 expect hip_tl grow_steps_frag "$tlj" "[4194304, 8388608, 12582912] 7340032"
+rc=0; ./heaptide run --gpu-timeline all --out "$w/hip_tl_exit" -- build/hip_tl 2> "$w/hip_tl_exit.err" || rc=$?
+expect hip_tl exit_after_hip_teardown "$rc" 0  # frag at exit once called HIP after its teardown (torch: 134)
+# a forked child's timeline points at its own samples (it kept the parent's: a point at 1.8e13 ms)
+TL_FORK=1 ./heaptide run --gpu-timeline all --every 50 --out "$w/hip_tl_fork" -- build/hip_tl 2>/dev/null || true
+tlf=$({ ./build/heaptide_report "$w/hip_tl_fork" --json 2>/dev/null || true; } | python3 -c 'import json,sys
+print(max(q[0] for p in json.load(sys.stdin) for x in p["gpu_timeline"] for q in x["points"]) < 60000)' 2>&1)
+expect hip_tl fork_points_in_run "$tlf" True
 run hip_tl_short --gpu-timeline all --every 100000 -- build/hip_tl  # no sample in the run: the report's own
 has hip_tl_short "GPU TIMELINE"
 run hip_tl_sites --gpu-timeline sites --every 50 -- build/hip_tl
@@ -245,6 +270,15 @@ rc=0; wait $p || rc=$?
 expect c_sleep slept_through_rc "$rc" 0
 ./build/heaptide_report "$w/c_sleep_s" > "$w/c_sleep.txt" 2>&1 || true
 has c_sleep "held by: a thread's stack"
+# every traced process answers a snapshot (the first to take the request file used to answer alone),
+# and --label keeps that state, the root's report included, for diff
+rm -rf "$w/snap_all"; ./heaptide run --out "$w/snap_all" -- sh -c 'build/c_sleep >/dev/null & exec build/c_snapshot' 2>/dev/null & p=$!
+waitfor 20 test -s "$w/snap_all/root" || true; sleep 0.3  # both have started their samplers
+./heaptide snapshot "$w/snap_all" --label s1 2>/dev/null || true
+waitfor 5 test "$(find "$w/snap_all" -maxdepth 1 -name 'heaptide.*.bin' -newer "$w/snap_all/snapshot" | wc -l)" -eq 2 && ok "snap_all both processes answered" || bad snap_all "not every process wrote a snapshot ($w/snap_all)"
+r=$(cat "$w/snap_all/root" 2>/dev/null || true); [[ -n $r && -e $w/snap_all/s1/heaptide.$r.bin ]] && ok "snap_all label keeps the root's report" || bad snap_all "no root report in $w/snap_all/s1"
+wait $p || true
+./heaptide diff "$w/snap_all/s1" "$w/snap_all" --fail-on none > /dev/null 2>&1 && ok "snap_all diff label vs exit" || bad snap_all "diff of the label failed"
 expect c_snapshot mid_blocks "${blk:-}" "$(( ${mid:-0} / 1024 ))"  # row counters flushed in the snapshot
 expect c_snapshot final_direct "$(grep -v snapshot "$w/c_snap.err" | grep -m1 -oE " direct=[0-9]+" | cut -d= -f2)" 40960
 # no process can be forked (RLIMIT_NPROC): the snapshot scans in place and undoes its marks
@@ -319,6 +353,15 @@ sb=$(grep -l heaptide_report "$w"/self/heaptide.*.bin | head -1 || true); [[ -n 
 rc=0; ./build/heaptide_report "$w/self1" --supp tests/self.supp --fail-on leaks > "$w/self.txt" 2>&1 || rc=$?
 expect self fail_on_leaks "$rc" 0
 has self "exe $here/build/heaptide_report"
+# the Mojo runtime's own rows (every frame in libKGENCompilerRTShared or startup) are kept out of LEAKS, PEAK, held
+expect self runtime_rows "$(./build/heaptide_report "$w/self1" --json --fail-on none 2>/dev/null | python3 -c 'import json,re,sys
+rt = re.compile(r"^(\[libKGENCompilerRTShared\.so\+|KGEN_CompilerRT|operator new|_start|__libc_start|start_thread|clone)")
+d = json.load(sys.stdin)[0]; s = [x["site"] for x in d["leaks"] + d["held"]]
+print(len(s) > 0, sum("KGEN" in x and all(rt.match(f) for f in x.split(" <- ")) for x in s))' 2>&1)" "True 0"
+# debuginfod: a module the server has no file for is noted once, then not asked again for 7 days
+strip -o build/c_leak_stripped build/c_leak; rm -rf "$w/dinfo" "$w/dcache"; ./heaptide run --out "$w/dinfo" -- build/c_leak_stripped 2>/dev/null || true
+dn() { XDG_CACHE_HOME="$PWD/$w/dcache" DEBUGINFOD_URLS=http://127.0.0.1:9 ./build/heaptide_report "$w/dinfo" --fail-on none 2>&1 >/dev/null | grep -c "no debug file for .*c_leak_stripped" || true; }
+expect debuginfod notes_first_second "$(dn) $(dn)" "1 0"
 # heaptide diff: a new leak site fails (exit 1), a grown peak is listed, a moved line is the same site
 cc -O0 -g -DEXTRA -o build/c_diff_b tests/c_diff.c 2>/dev/null
 run c_diff -- build/c_diff
@@ -416,6 +459,16 @@ rc=0; wait $p || rc=$?
 expect c_ownlock attach_exit "$rc" 0
 rc=0; timeout 60 ./heaptide run --out "$w/c_ownlock_run" -- build/c_ownlock > /dev/null 2> "$w/c_ownlock_run.err" || rc=$?
 expect c_ownlock run_exit "$rc" 0
+# attached, a thread whose first act is mmap has no stack for it: the exit scan must still copy the
+# mapping page by page (a guard page inside it faulted the in-place read: exit 139)
+cc -O0 -g -o build/c_mmapguard tests/c_mmapguard.c -lpthread
+rm -rf "$w/c_mmapguard"; build/c_mmapguard attach > "$w/c_mmapguard.out" 2> "$w/c_mmapguard.err" & p=$!
+waitfor 20 test -s "$w/c_mmapguard.out" || true
+./heaptide attach "$(head -1 "$w/c_mmapguard.out")" --out "$w/c_mmapguard" 2>/dev/null || true
+rc=0; wait $p || rc=$?
+expect c_mmapguard attach_exit "$rc" 0
+./build/heaptide_report "$w/c_mmapguard" > "$w/c_mmapguard.txt" 2>&1 || true
+has c_mmapguard "held by: global keep"
 # symbolizer lookup: none found -> modules only, never a crash; one on PATH wins over ROCm's
 HEAPTIDE_SYMBOLIZER=/nonexistent ./build/heaptide_report "$w/demo" --top 1 > "$w/nosym.txt" 2>&1 || true
 has nosym "sites show modules only"
@@ -444,7 +497,7 @@ if python3 -c "import numpy" 2>/dev/null; then
   has py_leak "py_leak.py:7"
   # one site per line (two bytecode offsets on line 6 are one row); numpy's array data reaches line 7
   # through PyTraceMalloc_Track (50 x 80 KiB)
-  expect py_leak line6_rows "$(sed -n '/^PYTHON/,$p' "$w/py_leak.txt" | grep -c 'py_leak.py:6$' || true)" 1
+  expect py_leak line6_rows "$(sed -n '/^PYTHON (/,/^PYTHON HOLDERS/p' "$w/py_leak.txt" | grep -c 'py_leak.py:6$' || true)" 1
   b7=$(sed -n '/^PYTHON/,$p' "$w/py_leak.txt" | awk '/py_leak.py:7$/ {print $1; exit}')
   (( ${b7:-0} >= 4096000 )) && ok "py_leak numpy data on line 7 ($b7 B)" || bad py_leak "line 7 holds '${b7:-none}' B, want >= 4096000 ($w/py_leak.txt)"
   # numpy's native frames; stripped libpython and numpy resolve to source through debuginfod
@@ -463,9 +516,25 @@ if python3 -c "import numpy" 2>/dev/null; then
   run py_gpu --py -- python3 tests/py_gpu.py "$here/build/tl/libamdhip64.so"
   expect py_gpu live_gpu "$(sum py_gpu live_gpu)" 1048576
   grep -qE "gpu  .*<- py::load_weights py_gpu.py" "$w/py_gpu.txt" && ok "py_gpu GPU site names py::load_weights" || bad py_gpu "no py frame on a gpu site ($w/py_gpu.txt)"
+  # which Python object holds a site's memory, in Python names (the 4 bytearrays of line 4: any index)
+  run py_held --py -- python3 tests/py_held.py
+  expect py_held chain "$(./build/heaptide_report "$w/py_held" --json --fail-on none 2>/dev/null | python3 -c 'import json,re,sys
+c = [h["held_by"] for x in json.load(sys.stdin) for h in x["py_held"] if h["site"].endswith("py_held.py:4")]
+print(re.sub(r"data\[\d\]", "data[i]", c[0]) if c else "none")' 2>&1)" "bytearray << Box.data[i] << __main__.keep['a']"
   run py_deep --py --py-depth 2 -- python3 tests/py_deep.py
   has py_deep "py_deep.py:4 <- "
   has py_deep "py_deep.py:6"
+  # sys.exit() keeps the script's globals (they were freed: the 5 MB vanished) and its status
+  rm -rf "$w/py_exit"; rc=0; ./heaptide run --py --out "$w/py_exit" -- python3 tests/py_exit.py >/dev/null 2>&1 || rc=$?
+  expect py_exit status "$rc" 3
+  ./build/heaptide_report "$w/py_exit" > "$w/py_exit.txt" 2>&1 || true
+  be=$(awk '/tests\/py_exit.py:6$/ {print $1; exit}' "$w/py_exit.txt")
+  (( ${be:-0} >= 5000000 )) && ok "py_exit line 6 holds $be B" || bad py_exit "line 6 holds '${be:-none}' B, want >= 5000000 ($w/py_exit.txt)"
+  # python -c CODE (the runner took "-c" for a script path: FileNotFoundError)
+  rm -rf "$w/py_c"; ./heaptide run --py --out "$w/py_c" -- python3 -c 'keep = [bytearray(100000) for _ in range(5)]' >/dev/null 2>&1 || true
+  ./build/heaptide_report "$w/py_c" > "$w/py_c.txt" 2>&1 || true
+  bc=$(awk '/<string>:1$/ {print $1; exit}' "$w/py_c.txt")
+  (( ${bc:-0} >= 500000 )) && ok "py_c <string>:1 holds $bc B" || bad py_c "<string>:1 holds '${bc:-none}' B, want >= 500000 ($w/py_c.txt)"
   # --py keeps its PYTHON section on SIGTERM and next to a snapshot
   rm -rf "$w/py_snap" "$w/py_term"
   ./heaptide run --py --out "$w/py_snap" -- python3 tests/py_hold.py >"$w/py_snap.out" 2>/dev/null & p=$!

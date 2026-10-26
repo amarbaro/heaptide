@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 AMARBARO · amarbaro.org labs
-# heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline all|sites,streams,frag] [--out DIR] -- CMD...
-# heaptide report DIR [args]   |   heaptide snapshot DIR (running process writes a report now)
+# heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline all|sites,streams,frag]
+#              [--no-children | --only NAME[,NAME]] [--out DIR] -- CMD...
+# heaptide report DIR [args]   |   heaptide snapshot DIR [--label NAME] (every running process writes a report now; NAME keeps them in DIR/NAME)
 # heaptide attach PID [--out DIR]   (a running process: gdb loads heaptide into it; root under Yama 1)
 # heaptide detach DIR   (a last snapshot, then the process runs on untracked: no restart)
 # heaptide flame DIR [-o OUT.html] [--open]   (an interactive flame graph, one offline HTML file)
@@ -11,10 +12,17 @@ set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 case "${1:-}" in
   report) shift; exec "$here/build/heaptide_report" "$@" ;;
-  snapshot) [[ -d ${2:-} ]] || { echo "FAIL heaptide: snapshot needs the run's --out DIR" >&2; exit 2; }
-            s=$2/.snapshot_req; : > "$s"; : > "$2/snapshot"  # returns once a report newer than the request is in place
-            for _ in $(seq 600); do [[ ! -e $2/snapshot && -n $(find "$2" -maxdepth 1 -name 'heaptide.*.bin' -newer "$s" -print -quit) ]] && { rm -f "$s"; echo "heaptide: snapshot written to $2" >&2; exit 0; }; sleep 0.1; done
-            rm -f "$s" "$2/snapshot"; echo "FAIL heaptide: no report in $2 within 60 s (process gone, or the snapshot was skipped: see its stderr)" >&2; exit 1 ;;
+  snapshot) [[ -d ${2:-} && ( -z ${3:-} || ( $3 == --label && ${4:-} =~ ^[A-Za-z0-9._-]+$ ) ) ]] ||
+              { echo "FAIL heaptide: snapshot DIR [--label NAME]   (DIR: the run's --out; NAME: letters, digits, . _ -)" >&2; exit 2; }
+            # every traced process answers the new mtime; this returns once the root's report (any, if the
+            # root is gone) is newer than the request. --label NAME keeps this state in DIR/NAME (hard links)
+            s=$2/snapshot; touch "$s"; r=$(cat "$2/root" 2>/dev/null || true); [[ -n $r && -d /proc/$r ]] || r='*'
+            for _ in $(seq 600); do
+              [[ -n $(find "$2" -maxdepth 1 -name "heaptide.$r.bin" -newer "$s" -print -quit) ]] || { sleep 0.1; continue; }
+              if [[ -n ${4:-} ]]; then shopt -s nullglob; f=("$2"/heaptide.*.bin "$2"/py.*.txt "$2"/pyheld.*.txt); mkdir -p "$2/$4"; ln -f "${f[@]}" "$2/$4/"; fi
+              echo "heaptide: snapshot written to $2${4:+ and kept in $2/$4}" >&2; exit 0
+            done
+            echo "FAIL heaptide: no report in $2 within 60 s (process gone, or the snapshot was skipped: see its stderr)" >&2; exit 1 ;;
   detach) [[ -d ${2:-} ]] || { echo "FAIL heaptide: detach needs the attach (or run) --out DIR" >&2; exit 2; }
           rc=0; "$here/heaptide" snapshot "$2" || rc=1
           : > "$2/detach"  # the process removes it once detached
@@ -46,21 +54,26 @@ case "${1:-}" in
             grep -iE 'ptrace|denied|error|No symbol' <<<"$r" | head -3 >&2; exit 2; }
           echo "heaptide: attached to $2; heaptide snapshot $o, or the report at its exit" >&2; exit 0 ;;
   run) shift ;;
-  *) echo "usage: heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline PARTS] [--out DIR] -- CMD... | heaptide report DIR [--json] [--top N] | heaptide snapshot DIR | heaptide diff BASE NEW [--fail-on new|grown|none] | heaptide attach PID [--out DIR] | heaptide detach DIR | heaptide flame DIR [-o OUT.html] [--open]" >&2; exit 2 ;;
+  *) echo "usage: heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline PARTS] [--no-children | --only NAME[,NAME]] [--out DIR] -- CMD... | heaptide report DIR [--json] [--top N] | heaptide snapshot DIR [--label NAME] | heaptide diff BASE NEW [--fail-on new|grown|none] | heaptide attach PID [--out DIR] | heaptide detach DIR | heaptide flame DIR [-o OUT.html] [--open]" >&2; exit 2 ;;
 esac
 out=.work/heaptide; py=0; pyd=1
 while [[ $# -gt 0 && $1 != -- ]]; do
-  case $1 in --py-depth|--every|--snapshot-every|--out|--gpu-timeline)
+  case $1 in --py-depth|--every|--snapshot-every|--out|--gpu-timeline|--only)
     [[ $# -ge 2 && $2 != -- && $2 != --* ]] || { echo "FAIL heaptide: $1 needs a value" >&2; exit 2; }
-    [[ $1 == --out || $1 == --gpu-timeline || $2 =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "FAIL heaptide: $1 takes a number, not $2" >&2; exit 2; } ;;
+    [[ $1 == --out || $1 == --gpu-timeline || $1 == --only || $2 =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "FAIL heaptide: $1 takes a number, not $2" >&2; exit 2; } ;;
   esac
   case $1 in
-    --gpu) export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE=0 MODULAR_DEVICE_CONTEXT_HOST_MEMORY_MANAGER_SIZE=0 ;;
+    # pooling allocators hand many buffers out of one device allocation: Mojo's and PyTorch's are off, so
+    # each buffer (tensor) is its own block with its own site
+    --gpu) export MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE=0 MODULAR_DEVICE_CONTEXT_HOST_MEMORY_MANAGER_SIZE=0 \
+                  PYTORCH_NO_CUDA_MEMORY_CACHING=1 PYTORCH_NO_HIP_MEMORY_CACHING=1 ;;
     --py) py=1 ;;
     --py-depth) pyd=$2; shift ;;
     --every) export HEAPTIDE_EVERY=$2; shift ;;
     --snapshot-every) export HEAPTIDE_SNAPSHOT_EVERY=$2; shift ;;
     --out) out=$2; shift ;;
+    --no-children) export HEAPTIDE_NOCHILD=1 ;;  # only the command itself is traced
+    --only) export HEAPTIDE_ONLY=$2; shift ;;  # only processes with these names (argv[0] basename)
     --gpu-timeline) m=0; for x in ${2//,/ }; do case $x in all) m=7;; sites) m=$((m | 1));; streams) m=$((m | 3));; frag) m=$((m | 5));;
                       *) echo "FAIL heaptide: --gpu-timeline takes all or sites,streams,frag, not $x" >&2; exit 2;; esac; done
                     export HEAPTIDE_GPU_TIMELINE=$m; shift ;;
@@ -70,7 +83,7 @@ while [[ $# -gt 0 && $1 != -- ]]; do
 done
 [[ ${1:-} == -- ]] && shift
 [[ $# -gt 0 ]] || { echo "FAIL heaptide: no command" >&2; exit 2; }
-mkdir -p "$out"; export HEAPTIDE_OUT=$(readlink -f "$out")
+mkdir -p "$out"; export HEAPTIDE_OUT=$(readlink -f "$out"); rm -f "$out/root"; unset HEAPTIDE_ROOT
 if (( py )); then
   export HEAPTIDE_PY=1
   [[ $(basename "$1") == python* ]] || { echo "FAIL heaptide: --py needs a python command" >&2; exit 2; }

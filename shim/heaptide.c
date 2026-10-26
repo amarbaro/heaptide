@@ -22,6 +22,7 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -95,7 +96,7 @@ static void flush(pend_t *e) {
 }
 static void bump(uint32_t id, int64_t a, int64_t b, int64_t t, int64_t ln, int64_t lb) {
   if (my_slot < 0) new_thread();
-  if (my_slot >= SLOTS || (tl_parts && (rows[id].kind == GPU || rows[id].kind == HOST))) {  // shared slot, or a timeline row
+  if (my_slot >= SLOTS || rows[id].kind == GPU || rows[id].kind == HOST) {  // shared slot, or a device row: read current (timeline, py holders)
     row_t *r = &rows[id];
     r->allocs += a; r->bytes += b; r->temps += t; r->live_n += ln; r->live_b += lb;
     return;
@@ -139,6 +140,9 @@ static void *vm(size_t n) {  // raw syscall: our own memory never passes the mma
   void *p = (void *)syscall(SYS_mmap, 0, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   return p == MAP_FAILED ? 0 : p;
 }
+// The big arenas, touched from their start as they fill: under THP "always" each first touch was a
+// 2 MiB page (sleep: +7.2 MB RSS, now +1.1 MB). Hash tables and scan arrays keep huge pages (TLB).
+static void *cold(size_t n) { void *p = vm(n); if (p) syscall(SYS_madvise, p, n, MADV_NOHUGEPAGE); return p; }
 static uint64_t mix(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; return x; }
 static void lock(atomic_flag *f) { while (atomic_flag_test_and_set_explicit(f, memory_order_acquire)) ; }
 static void unlock(atomic_flag *f) { atomic_flag_clear_explicit(f, memory_order_release); }
@@ -241,18 +245,20 @@ static int unw_ready(void) {
   return unw_ok || !unw_h || (unw_ok = !dlinfo(unw_h, RTLD_DI_TLS_DATA, &t) && t);
 }
 __attribute__((always_inline)) static inline uint32_t stack_id(int kind) {  // inlined: one less frame to unwind
-  if (kind == MMAP && !unw_ready()) return 0;
+  // no unwind yet: a stackless row of its own, so the exit scan still reads the block as a mapping
+  if (kind == MMAP && !unw_ready()) return intern((void *[1]){0}, 0, kind);
   void *buf[DEPTH + 4], **ips = buf;
-  int d = unw_backtrace(buf, depth + 4);
+  int max = kind == GPU || kind == HOST ? DEPTH : depth;  // device buffers are few and big: the whole stack, to
+  int d = unw_backtrace(buf, max + 4);                    // the Python line under torch's C++ even with --py
   while (d && (uintptr_t)*ips - self_lo < self_n) ips++, d--;  // our own frames
-  if (d > depth) d = depth;
+  if (d > max) d = max;
   // a stack ends before the first return address it repeats: recursion (an interpreter loop
   // re-entered through C, as CPython does for every import and callback) adds no new site
   for (int i = 1; i < d; i++)
     for (int j = 0; j < i; j++)
       if (ips[j] == ips[i]) { d = i; goto cut; }
 cut:;
-  if (stream_tag && d < depth && ips + d < buf + DEPTH + 4) ips[d++] = (void *)(1ULL << 63 | stream_tag);
+  if (stream_tag && d < max && ips + d < buf + DEPTH + 4) ips[d++] = (void *)(1ULL << 63 | stream_tag);
   return intern(ips, d, kind);
 }
 
@@ -492,8 +498,10 @@ static uint64_t dev_used(void) {  // device bytes in use (all its users), ~0 whe
   REAL((size_t *, size_t *), "hipMemGetInfo");
   return r && !r(&fr, &to) ? to - fr : ~0ULL;
 }
-// before the program's first GPU allocation: what the device's other users hold
-#define FRAG_BASE() if ((tl_parts & 4) && frag_base == ~0ULL) frag_base = dev_used()
+// before the program's first GPU allocation: what the device's other users hold. HIP is up by then, so
+// no_frag runs before HIP's exit destructors: after them hipMemGetInfo aborts (torch + rocprofiler-sdk)
+static void no_frag(void) { tl_parts &= 3; }
+#define FRAG_BASE() if ((tl_parts & 4) && frag_base == ~0ULL) frag_base = dev_used(), atexit(no_frag)
 HOOK int hipMalloc(void **p, size_t n) { REAL((void **, size_t), "hipMalloc"); FRAG_BASE(); int e = IN(r(p, n)); if (!e) track(*p, n, GPU); return e; }
 HOOK int hipMallocAsync(void **p, size_t n, void *s) {
   REAL((void **, size_t, void *), "hipMallocAsync"); FRAG_BASE(); int e = IN(r(p, n, s));
@@ -531,7 +539,9 @@ HOOK void *dlsym(void *h, const char *name) {
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000ULL + t.tv_nsec; }
 static void report(int final);
 static void py_dump(pid_t pid);
+static void py_snap(void);  // --py: holder chains for this snapshot
 static char outdir[4096] = ".";
+static int is_root, nochild;  // the run's first traced process (its .bin says so); --no-children
 static uint64_t snap_ns;  // --snapshot-every
 static volatile sig_atomic_t got_sig, py_wait, py_pending;
 // the sampler reports; nothing unsafe here. Under --py a signal before the runner is ready waits
@@ -556,13 +566,14 @@ static void on_crash(int sig, siginfo_t *si, void *ctx) {
 static pid_t child;  // the fork that writes a snapshot
 // Samples live bytes; on SIGTERM/SIGINT/SIGHUP writes the final report and dies of the signal;
 // writes a snapshot every --snapshot-every, or when OUT/snapshot appears (heaptide snapshot).
+static uint64_t tl_last[4096 + 2];  // each timeline row's last value (a sample adds only changes)
 static void tl_add(uint64_t i, uint32_t id, uint64_t v, uint64_t *last) {
   if (v != *last && ntl < MAXSAMPLES) tl[ntl][0] = i << 32 | id, tl[ntl++][1] = v, *last = v;
 }
 // One timeline sample: every watched site whose live bytes moved, and for frag (once the program
 // itself has made a GPU allocation: never initialise HIP for it) what the device holds beyond them.
 static void timeline(uint64_t i) {
-  static uint64_t last[4096 + 2];
+  uint64_t *last = tl_last;
   uint32_t n = ngids < 4096 ? ngids : 4096;
   for (uint32_t g = 0; g < n; g++) tl_add(i, gids[g], rows[gids[g]].live_b, &last[g]);
   uint64_t gpu = live_total(GPU);
@@ -589,12 +600,18 @@ static void *sampler(void *a) {
   char trig[4200], dtrig[4200];
   snprintf(trig, sizeof trig, "%s/snapshot", outdir);
   snprintf(dtrig, sizeof dtrig, "%s/detach", outdir);
+  // heaptide snapshot touches OUT/snapshot: each traced process answers every new mtime once (the first
+  // to remove the file took a request alone, so the root's report often never came)
+  struct stat st;
+#define MTIME(old) (!stat(trig, &st) ? st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec : (old))
+  int64_t seen = MTIME(0);  // a request from before this process started is not its own
   for (uint64_t next = now_ns() + snap_ns; !stop;) {
     sample();
     if (got_sig) { int sig = got_sig; report(1); signal(sig, SIG_DFL); raise(sig); }
     if (!access(dtrig, F_OK)) { detach(); unlink(dtrig); return 0; }  // gone: heaptide detach returns
     if (child > 0 && syscall(SYS_wait4, child, 0, WNOHANG | __WCLONE, 0) == child) child = 0;
-    if (child <= 0 && ((snap_ns && now_ns() >= next) || !unlink(trig))) report(0), next = now_ns() + snap_ns;
+    int64_t m = MTIME(seen);
+    if (child <= 0 && ((snap_ns && now_ns() >= next) || m != seen)) seen = m, py_snap(), report(0), next = now_ns() + snap_ns;
     nanosleep(&d, 0);
   }
   return 0;
@@ -618,6 +635,15 @@ static uint64_t *held, cur;
 enum { RUN = 16, BATCH = 16 };
 static ent_t *starts;  // {start, its live-table entry}
 static uint64_t *top, *top2, nstarts, ntop, heap_lo, heap_hi;
+// glibc's bins (main_arena, in malloc's module's data) point at free chunks' headers, and a header lies
+// in the last 16 B of the block before it: while that data is scanned (bins = 1), a word equal to the
+// next chunk's header address of a block does not hold it (else a leak hides, layout permitting)
+static uint64_t ma_base, ma_lo, ma_hi;
+static int bins;
+static int binned(uint64_t w, const ent_t *x) {
+  uint64_t n = x->v >> SIZE_SHIFT, c = n + 23 < 32 ? 32 : (n + 23) & ~15ULL;  // chunk size
+  return bins && w == x->k + c - 16;
+}
 static int cmp64(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return (x > y) - (x < y); }
 static void scan(const char *b, const char *e, uint64_t bit) {
   b = (const char *)(((uintptr_t)b + 7) & ~7UL);
@@ -651,7 +677,7 @@ static void scan(const char *b, const char *e, uint64_t bit) {
     for (int j = 0; j < k; j++) {
       ent_t *x = (ent_t *)r[j]->v;
       // GPU/host blocks are never roots-reachable: the HIP runtime's own tables point at all of them
-      if (w[j] < x->k + (x->v >> SIZE_SHIFT) && !(x->v & (REACH | INDIRECT)) && heap(x->v)) {
+      if (w[j] < x->k + (x->v >> SIZE_SHIFT) && !(x->v & (REACH | INDIRECT)) && heap(x->v) && !binned(w[j], x)) {
         x->v |= bit; work[nwork++] = x;
         if (bit == REACH && !held[x->v & (REACH - 1)]) held[x->v & (REACH - 1)] = cur ? cur : 1ULL << 63 | (uint64_t)wa[j];
       }
@@ -703,6 +729,7 @@ static int root_cb(struct dl_phdr_info *in, size_t sz, void *self) {
     if (ph->p_type == PT_LOAD && (ph->p_flags & PF_W)) {
       uint64_t b = in->dlpi_addr + ph->p_vaddr;
       if (nsegs < 4096) segs[nsegs][0] = b, segs[nsegs++][1] = b + ph->p_memsz;
+      if (in->dlpi_addr == ma_base) ma_lo = ma_lo && ma_lo < b ? ma_lo : b, ma_hi = ma_hi > b + ph->p_memsz ? ma_hi : b + ph->p_memsz;
     }
   }
   return 0;
@@ -926,6 +953,7 @@ static atomic_flag reporting;
 static void report(int final) {
   struct timespec ms = {0, 1000000};
   while (atomic_flag_test_and_set(&reporting)) nanosleep(&ms, 0);
+  if (final) tl_parts &= 3;  // at exit HIP may be torn down: no device calls
   if (tl) sample();  // the state at this report: a program shorter than one --every still has a point
   if (done) { atomic_flag_clear(&reporting); return; }
   if (final) done = 1, ready = 0, stop = 1;
@@ -933,7 +961,9 @@ static void report(int final) {
   int g = guard; guard = 1;
   nsegs = 0; nstarts = 0; nwork = 0; heap_hi = 0;
   segs = vm(4096 * 16);
-  Dl_info me; dladdr((void *)report, &me);
+  Dl_info me, ma;
+  ma_base = dladdr((void *)r_malloc, &ma) ? (uint64_t)ma.dli_fbase : 0; ma_lo = ma_hi = 0;
+  dladdr((void *)report, &me);
   dl_iterate_phdr(root_cb, me.dli_fbase);
   int all_parked = stop_threads(!final);
   if (!final && !all_parked) {
@@ -993,7 +1023,8 @@ static void report(int final) {
   if (!top || !top2) goto nomem;
   for (size_t i = 0; i < nstarts; i += RUN) top[i / RUN] = starts[i].k;
   for (size_t i = 0; i < ntop; i += RUN) top2[i / RUN] = top[i];
-  for (int i = 0; i < nsegs; i++) scan((char *)segs[i][0], (char *)segs[i][1], REACH), flood(REACH);
+  for (int i = 0; i < nsegs; i++)
+    bins = segs[i][0] >= ma_lo && segs[i][0] < ma_hi, scan((char *)segs[i][0], (char *)segs[i][1], REACH), bins = 0, flood(REACH);
   if (npre) scan_ranges(pre, npre, 1ULL << 61);
   // Private writable memfd mappings are anonymous memory with a name: Qt's JavaScript engine keeps its
   // GC heap there (JSGCHeap, JSVMStack), other VMs and JITs do the same. Never tracked as blocks (they
@@ -1047,7 +1078,9 @@ static void report(int final) {
   snprintf(tmp, sizeof tmp, "%s.tmp", path);
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
-    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms, 7 | (tl ? 8 : 0) | (attached ? 16 : 0) /* leaked block counts, retention, timeline, then maps text; attached */, 0};
+    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms,
+                       7 | (tl ? 8 : 0) | (attached ? 16 : 0) | 32 | (is_root ? 64 : 0) /* leaked block counts, retention, timeline, then
+                       maps text; attached; the command line after the maps; root */, 0};
     wr(fd, hdr, sizeof hdr);
     wr(fd, ips_arena, ips_used * 8);
     wr(fd, rows + 1, n * sizeof(row_t));
@@ -1062,6 +1095,9 @@ static void report(int final) {
     for (ssize_t k; in >= 0 && ((k = read(in, buf, sizeof buf)) > 0 || (k < 0 && errno == EINTR));)
       if (k > 0) wr(fd, buf, k), hdr[7] += k;
     if (in >= 0) close(in);
+    uint64_t cl[513] = {0};  // {length, /proc/self/cmdline up to 4 KiB}
+    if ((in = open("/proc/self/cmdline", O_RDONLY)) >= 0) { ssize_t k = read(in, cl + 1, 4096); cl[0] = k > 0 ? k : 0; close(in); }
+    wr(fd, cl, 8 + cl[0]);
     pwrite(fd, &hdr[7], 8, 56);
     close(fd);
     rename(tmp, path);
@@ -1134,6 +1170,9 @@ static struct {
   void (*ungil)(int);
   const char *(*utf8)(void *);
   void (*incref)(void *), (*decref)(void *);
+  void *(*call)(void *);
+  int (*pending)(int (*)(void *), void *);
+  void (*errclear)(void);
 } P;
 static uint32_t py_name(uint64_t h, void **c, int *at, int d) {  // two offsets on one line are one site
   if (py_n >= MAXPY) return 0;
@@ -1222,10 +1261,12 @@ HOOK int heaptide_py_start(const char *self) {
   P.line = r_dlsym(RTLD_DEFAULT, "PyCode_Addr2Line"); P.utf8 = r_dlsym(RTLD_DEFAULT, "PyUnicode_AsUTF8");
   P.incref = r_dlsym(RTLD_DEFAULT, "Py_IncRef"); P.decref = r_dlsym(RTLD_DEFAULT, "Py_DecRef");
   P.gil = r_dlsym(RTLD_DEFAULT, "PyGILState_Ensure"); P.ungil = r_dlsym(RTLD_DEFAULT, "PyGILState_Release");
+  P.call = r_dlsym(RTLD_DEFAULT, "PyObject_CallNoArgs"); P.pending = r_dlsym(RTLD_DEFAULT, "Py_AddPendingCall");
+  P.errclear = r_dlsym(RTLD_DEFAULT, "PyErr_Clear");  // the three: holder chains in snapshots only, optional
   py_lasti = !!(P.at = r_dlsym(RTLD_DEFAULT, "PyFrame_GetLasti"));  // 3.11+; before, the line itself is the key
   if (!py_lasti) P.at = r_dlsym(RTLD_DEFAULT, "PyFrame_GetLineNumber");
   if (!get || !set || !P.frame || !P.code || !P.back || !P.getattr || !P.line || !P.utf8 || !P.incref || !P.decref || !P.at || !P.gil || !P.ungil) return 1;
-  if (!(py_rows = vm(MAXPY * sizeof(pyrow_t))) || !(py_names = vm(PYNAMES))) return 1;
+  if (!(py_rows = cold(MAXPY * sizeof(pyrow_t))) || !(py_names = cold(PYNAMES))) return 1;
   char *e = getenv("HEAPTIDE_PY_DEPTH");
   py_depth = e && atoi(e) > 0 ? (atoi(e) < 8 ? atoi(e) : 8) : 1;
   snprintf(py_self, sizeof py_self, "%s", self);
@@ -1240,15 +1281,19 @@ HOOK int heaptide_py_start(const char *self) {
 }
 // py.<pid>.txt: the 20 Python sites holding the most, as the report prints them. The runner writes it
 // at exit (before finalization frees everything) and on a stop signal; a snapshot's fork writes it too.
-static void py_dump(pid_t pid) {
-  if (!py_on) return;
-  uint32_t top[20]; int nt = 0;
-  for (uint32_t s = 1; s < py_n; s++) {
+static int py_top(uint32_t top[20]) {  // the 20 sites holding the most, largest first
+  int nt = 0;
+  for (uint32_t s = 1; py_on && s < py_n; s++) {
     if (py_rows[s].hide || py_rows[s].bytes <= 0) continue;
     int i = nt < 20 ? nt++ : 20;
     for (; i > 0 && py_rows[top[i - 1]].bytes < py_rows[s].bytes; i--) if (i < 20) top[i] = top[i - 1];
     if (i < 20) top[i] = s;
   }
+  return nt;
+}
+static void py_dump(pid_t pid) {
+  if (!py_on) return;
+  uint32_t top[20]; int nt = py_top(top);
   char path[4200], tmp[4210];
   snprintf(path, sizeof path, "%s/py.%d.txt", outdir, pid);
   snprintf(tmp, sizeof tmp, "%s.tmp", path);
@@ -1260,6 +1305,38 @@ static void py_dump(pid_t pid) {
   rename(tmp, path);
 }
 HOOK void heaptide_py_dump(void) { py_dump(getpid()); }
+// --py holder chains (py/run.py held): which Python object holds the top sites' memory, in Python names.
+// The runner maps objects to sites through these, with the GIL held (the Python hooks run under it too).
+HOOK int heaptide_py_top(uint32_t top[20]) { return py_top(top); }
+HOOK const char *heaptide_py_name(uint32_t s) { return py_on && s && s < py_n ? py_names + py_rows[s].name : ""; }
+HOOK long heaptide_py_site_of(uint64_t a) {  // the Python site of the block starting at a, or -1
+  ent_t *x = py_live.t ? slot(&py_live, a) : 0;
+  return x && x->k == a ? (long)(x->v & (REACH - 1)) : -1;
+}
+HOOK int heaptide_gpu_top(uint32_t top[5]) {  // the 5 GPU stacks holding the most now
+  int nt = 0;
+  for (uint32_t s = 1; s <= nstacks && s < maxstacks; s++) {
+    if (rows[s].kind != GPU || !rows[s].live_b) continue;
+    int i = nt < 5 ? nt++ : 5;
+    for (; i > 0 && rows[top[i - 1]].live_b < rows[s].live_b; i--) if (i < 5) top[i] = top[i - 1];
+    if (i < 5) top[i] = s;
+  }
+  return nt;
+}
+HOOK long heaptide_gpu_site_of(uint64_t a) {  // the stack id of the GPU block starting at a, or -1
+  tab_t *t = shard(live, a);
+  lock(&t->lk);
+  ent_t *x = t->t ? slot(t, a) : 0;
+  long id = x && x->k == a && rows[x->v & (REACH - 1)].kind == GPU ? (long)(x->v & (REACH - 1)) : -1;
+  unlock(&t->lk);
+  return id;
+}
+// a snapshot asks the runner's held() for chains: it runs on the main thread at the next bytecode,
+// with the GIL, so the chains may trail the snapshot's .bin
+static void *py_walker;
+static int py_walk(void *a) { (void)a; void *r = P.call(py_walker); if (r) P.decref(r); else P.errclear(); return 0; }
+HOOK void heaptide_py_walker(void *f) { py_walker = P.call && P.pending && P.errclear ? f : 0; }
+static void py_snap(void) { if (py_walker) P.pending(py_walk, 0); }
 // A python with libpython linked into the executable (Debian, Ubuntu) defines PyTraceMalloc_Track
 // itself, ahead of any preload: an extension's calls never reach ours. Their GOT slots are pointed at
 // ours instead, each time an extension loads (its PyInit_ lookup comes before its code runs).
@@ -1306,18 +1383,27 @@ static void fork_unlock(void) {
 // sampler restarted.
 static void forked(void) {
   fork_unlock();
+  is_root = 0;
+  if (nochild) done = 1, ready = 0;  // --no-children: not traced from here, no report
   if (done) return;  // after the final report or a detach: nothing to restart
   flush_all();
   for (int i = 0; i < SHARDS; i++)
     for (size_t j = 0; j < live[i].cap; j++) live[i].t[j].v |= live[i].t[j].k ? REACH : 0;
   for (size_t i = 0; i < nmm; i++) mm[i].inh = 1;
-  nsamples = 0;
+  nsamples = 0, ntl = 0;  // the child's own samples: the parent's indices would point past them
+  memset(tl_last, 0, sizeof tl_last);
   pthread_t t;
   guard = 1;
   if (!pthread_create(&t, 0, sampler, 0)) pthread_detach(t);
   guard = 0;
 }
 
+static int listed(const char *l, const char *n) {  // n is an item of the comma list l
+  size_t k = strlen(n);
+  for (const char *p = l; k && (p = strstr(p, n)); p += k)
+    if ((p == l || p[-1] == ',') && (p[k] == ',' || !p[k])) return 1;
+  return 0;
+}
 __attribute__((constructor)) static void init(void) {
   { // one unwind now: libunwind's thread key is created while few exist (an index under 32 needs no
     // glibc key block, so pthread_setspecific never allocates inside a hook); its handle for unw_ready
@@ -1327,6 +1413,11 @@ __attribute__((constructor)) static void init(void) {
       unw_h = 0;  // no thread-local state: always ready
   }
   resolve();
+  // --no-children, --only NAME,...: any other process keeps the preload untraced (hooks pass through,
+  // no memory, no file). The root is the first traced process, or an exec'd root (same pid).
+  const char *rt = getenv("HEAPTIDE_ROOT"), *only = getenv("HEAPTIDE_ONLY");
+  is_root = !rt || atoi(rt) == getpid(); nochild = !!getenv("HEAPTIDE_NOCHILD");
+  if (!getenv("HEAPTIDE_ATTACH") && ((nochild && !is_root) || (only && !listed(only, program_invocation_short_name)))) return;
   // Mojo allocates through its bundled tcmalloc, which malloc hooks never see. Its runtime's sanitizer
   // switch routes every Mojo allocation to libc malloc/aligned_alloc/free instead (and no tcmalloc
   // arena is mapped): set before Mojo allocates, so no tcmalloc block is ever handed to free
@@ -1338,10 +1429,10 @@ __attribute__((constructor)) static void init(void) {
   struct rlimit as;
   for (; !getrlimit(RLIMIT_AS, &as) && as.rlim_cur != RLIM_INFINITY && maxstacks > 4096 &&
          maxstacks * sizeof(row_t) + ips_cap * 8 > as.rlim_cur / 4;) maxstacks /= 2, ips_cap /= 2;
-  rows = vm((size_t)maxstacks * sizeof(row_t));
-  ips_arena = vm(ips_cap * 8);
-  samples = vm((size_t)MAXSAMPLES * 24);
-  mm = vm((size_t)sizeof(map_t) << 20); rs = vm((size_t)sizeof(map_t) << 20); dn = vm((size_t)sizeof(map_t) << 20);
+  rows = cold((size_t)maxstacks * sizeof(row_t));
+  ips_arena = cold(ips_cap * 8);
+  samples = cold((size_t)MAXSAMPLES * 24);
+  mm = cold((size_t)sizeof(map_t) << 20); rs = cold((size_t)sizeof(map_t) << 20); dn = cold((size_t)sizeof(map_t) << 20);
   if (!rows || !ips_arena || !samples || !mm || !rs || !dn) {
     dprintf(2, "heaptide: FAIL out of address space (ulimit -v?): not recording\n");
     return;
@@ -1353,7 +1444,13 @@ __attribute__((constructor)) static void init(void) {
   dl_iterate_phdr(self_cb, me.dli_fbase);
   unw_set_caching_policy(unw_local_addr_space, UNW_CACHE_PER_THREAD);
   if ((e = getenv("HEAPTIDE_OUT"))) snprintf(outdir, sizeof outdir, "%s", e);
-  if ((e = getenv("HEAPTIDE_GPU_TIMELINE")) && (tl_parts = atoi(e) & 7)) tl = vm((size_t)MAXSAMPLES * 16);
+  if (is_root) {  // OUT/root names it for heaptide snapshot; its children see the variable
+    char v[16], path[4200]; snprintf(v, sizeof v, "%d", getpid()); setenv("HEAPTIDE_ROOT", v, 1);
+    snprintf(path, sizeof path, "%s/root", outdir);
+    int f = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (f >= 0) dprintf(f, "%s\n", v), close(f);
+  }
+  if ((e = getenv("HEAPTIDE_GPU_TIMELINE")) && (tl_parts = atoi(e) & 7)) tl = cold((size_t)MAXSAMPLES * 16);
   if ((e = getenv("HEAPTIDE_SNAPSHOT_EVERY")) && atof(e) > 0) snap_ns = (uint64_t)(atof(e) * 1e9);
   // report on the usual stop signals, only where the program kept the default (it may set its own later)
   struct sigaction sa = {.sa_handler = on_term, .sa_flags = SA_RESTART}, old;

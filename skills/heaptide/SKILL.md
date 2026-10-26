@@ -36,6 +36,11 @@ JSON, not the text: it is the stable interface.
      GPU sites end in the Python function that made them (`<- py::load_weights train.py`); the
      report must run on the same machine (it reads `/tmp/perf-<pid>.map`). Add `--py-depth 4` when
      one helper is called from many places: PYTHON then shows each call chain, not one line.
+   - Child processes are traced too, each in its own report section named by its command;
+     `--no-children` traces the command alone, `--only NAME[,NAME]` only those process names.
+     A process that leaves through `_exit()` (dash, Ubuntu's `sh`) writes no report: run `bash -c`.
+   - `heaptide snapshot .work/ht --label NAME` keeps that moment's reports in `.work/ht/NAME`
+     (before/after pairs for `heaptide diff`).
    - Short runs need a faster sampler or GROWTH says `too short`: `--every 20` under a few
      seconds, `--every 1` under one second.
    - Servers and long jobs: stop them with SIGTERM or Ctrl-C (the report is still written), or

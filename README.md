@@ -9,8 +9,9 @@ LeakSanitizer's. It also sees HIP device and pinned host memory, Mojo's GPU buff
 which no other leak tool we know of covers on ROCm.
 
 ```
-heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline PARTS] [--out DIR] -- CMD...
-heaptide snapshot DIR                                  a running process writes its report now
+heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--snapshot-every S] [--gpu-timeline PARTS]
+             [--no-children | --only NAME[,NAME]] [--out DIR] -- CMD...
+heaptide snapshot DIR [--label NAME]                   every traced process writes its report now (NAME keeps them in DIR/NAME)
 heaptide diff BASE NEW [--fail-on new|grown|none] [--json] [--top N]   exit 1 on a new leak site
 heaptide attach PID [--out DIR]                        a running process, no restart (gdb; sudo under Yama 1)
 heaptide detach DIR                                    a last snapshot, then the process runs on untracked
@@ -104,16 +105,21 @@ GPU targets need ROCm/HIP. Python mode hooks CPython's own allocators (no `trace
 - `--gpu` sets `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE=0` and
   `MODULAR_DEVICE_CONTEXT_HOST_MEMORY_MANAGER_SIZE=0`. Mojo normally sub-allocates from a
   ~490 MiB device pool and a pinned host pool it keeps until exit. Without the flag heaptide sees
-  one big block, and the host pool shows up as a leak. Leak findings are the same either way;
+  one big block, and the host pool shows up as a leak. It also sets `PYTORCH_NO_CUDA_MEMORY_CACHING=1` and
+  `PYTORCH_NO_HIP_MEMORY_CACHING=1`, so each tensor is its own device block. Leak findings are the same either way;
   PEAK and peak memory under `--gpu` are those of the unpooled allocator, not of production.
-- `--py CMD` takes a python command (`python script.py ...` or `python -m pkg.module ...`) and charges every Python
+- `--py CMD` takes a python command (`python script.py ...`, `python -m pkg.module ...` or `python -c CODE ...`) and charges every Python
   allocation to its line, 1 frame deep (CPython's allocator hooks, as memray does; extensions' own buffers, such as numpy's
   array data, through `PyTraceMalloc_Track`; GIL builds only);
   `--py-depth N` keeps N frames and shows each site as its call chain (on `tests/py_leak.py`:
   0.14 s at 1 frame, 0.15 s at 2, 0.20 s at 8, bare 0.05 s). Native
   stacks are capped at 8 frames (`HEAPTIDE_DEPTH`, default 64), because most Python-mode stacks
   are CPython's own and deeper frames only split them.
+  Under `--py` the report also names, in Python, the object that holds each top site's memory and the
+  biggest GPU tensors (`bytearray << Box.data[0] << __main__.keep['a']`).
 - `--every MS` sets the GROWTH sampling period (default 100).
+- Child processes are traced too, each with its own report section named by its command. `--no-children`
+  traces the command alone; `--only NAME[,NAME]` traces only processes with those names (argv[0] basename).
 - Long-running processes: SIGTERM, SIGINT and SIGHUP write the report before the process dies of
   the signal (exit status unchanged), unless the program installed its own handler, which is left
   alone (with `--py`, the PYTHON section is written too). `heaptide snapshot DIR` makes a running
@@ -122,6 +128,8 @@ GPU targets need ROCm/HIP. Python mode hooks CPython's own allocators (no `trace
   snapshot pauses the program only to fork it (10M live blocks: 15 ms) and scans the copy, which
   can cost up to the heap's size in memory while the program rewrites its pages; it is skipped if
   a thread cannot be parked.
+- A process that leaves through `_exit()` writes no report, since exit handlers do not run (dash, Ubuntu's `sh`,
+  does this: trace `bash -c` instead).
 - A crash (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT) writes the report, then the process dies of
   the signal; best effort, since the heap may be broken (it gives up after 10 s).
 - `report --growth-limit MIB` fails GROWTH on a projected rise above MIB, whatever the mean.

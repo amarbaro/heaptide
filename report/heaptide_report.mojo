@@ -18,7 +18,9 @@ cut -d'"' -f2 "$I" | sort -u | while IFS= read -r m; do
   readelf -S "$m" 2>/dev/null | grep -q debug_info && continue
   id=$(readelf -n "$m" 2>/dev/null | awk '/Build ID/{print $3}'); [ -n "$id" ] || continue
   d=$c/$id/debuginfo
-  [ -s "$d" ] || [ -z "${DEBUGINFOD_URLS:-}" ] || { mkdir -p "$c/$id" && curl -sfL --max-time 120 "${DEBUGINFOD_URLS%% *}/buildid/$id/debuginfo" -o "$d.tmp" && mv "$d.tmp" "$d" || echo "note: debuginfod has no debug file for $m" >&2; }
+  [ -s "$d" ] || [ -z "${DEBUGINFOD_URLS:-}" ] || [ -n "$(find "$c/$id/none" -mtime -7 2>/dev/null)" ] ||
+    { mkdir -p "$c/$id" && curl -sfL --max-time 120 "${DEBUGINFOD_URLS%% *}/buildid/$id/debuginfo" -o "$d.tmp" && mv "$d.tmp" "$d" ||
+      { : > "$c/$id/none"; echo "note: debuginfod has no debug file for $m (not asked again for 7 days)" >&2; }; }
   [ -s "$d" ] && sed -i "s|^\\"$m\\" |\\"$d\\" |" "$I"
 done
 """
@@ -93,6 +95,22 @@ def load_maps(text: String) raises -> List[Mapping]:
         if not found:
             out.append(Mapping(s, e, p))
     return out^
+
+
+def residue(site: String) -> Bool:
+    # the Mojo runtime's own memory: every frame in its library (stripped, no debuginfod file) or in
+    # startup and allocator code. Kept out of LEAKS, PEAK and held like a --supp line.
+    if "KGENCompilerRT" not in site and "KGEN_CompilerRT" not in site:
+        return False
+    var runtime: List[String] = ["[libKGENCompilerRTShared.so+", "KGEN_CompilerRT", "operator new", "_start", "__libc_start", "start_thread", "clone"]
+    for f in site.split(" <- "):
+        var ours = False
+        for p in runtime:
+            if f.startswith(p):
+                ours = True
+        if not ours:
+            return False
+    return True
 
 
 def top(stacks: List[Stack], key: Int, n: Int, among: List[Int]) -> List[Int]:
@@ -831,6 +849,12 @@ def main() raises:
             with open(dir + "/heaptide." + pid + ".maps", "r") as f:
                 maps_text = f.read()
         var maps = load_maps(maps_text)
+        var is_root = (u64(b, 48) & 64) == 64  # since v0.1.6: the run's first traced process
+        var cmdline = String("")  # since v0.1.6 (flag 32): {u64 length, /proc/self/cmdline} after the maps
+        var cl_at = maps_at + nmaps
+        if (u64(b, 48) & 32) == 32 and len(b) >= cl_at + 8 and u64(b, cl_at) <= 4096 and len(b) >= cl_at + 8 + Int(u64(b, cl_at)):
+            cmdline = String(String(from_utf8_lossy=Span(b)[cl_at + 8 : cl_at + 8 + Int(u64(b, cl_at))]).replace("\x00", " ").strip())
+        var exe = maps[0].path if len(maps) > 0 else String("?")
         if flame_data or folded >= 0:
             flames.append(flame(stacks, maps, b, smp_at, nsamp, dir, pid, attached, folded))
             continue
@@ -840,7 +864,8 @@ def main() raises:
             all_ids.append(s)
             if field(stacks[s], 0) > 0:
                 leaking.append(s)
-        var sections = [leaking^, top(stacks, 1, n_top, all_ids), top(stacks, 2, n_top, all_ids), top(stacks, 3, n_top, all_ids)]
+        # PEAK: twice the rows, so --top N remain once the Mojo runtime's own are dropped (named below)
+        var sections = [leaking^, top(stacks, 1, 2 * n_top, all_ids), top(stacks, 2, n_top, all_ids), top(stacks, 3, n_top, all_ids)]
         var wanted = List[Int]()
         var seen = List[Bool](length=len(stacks), fill=False)
         for sec in sections:
@@ -875,7 +900,27 @@ def main() raises:
                     seen[Int(id) - 1] = True
                     wanted.append(Int(id) - 1)
             tl_peak[i] = max(tl_peak[i], v)
+        var py_held = List[List[String]]()  # --py: {kind py|gpu, Python site | stack id, holder chain}, from py/run.py
+        try:
+            with open(dir + "/pyheld." + pid + ".txt", "r") as f:
+                for l in f.read().split("\n"):  # not splitlines(): it splits at tabs too
+                    var p = l.split("\t")
+                    if len(p) == 3:
+                        py_held.append([String(p[0]), String(p[1]), String(p[2])])
+                        if p[0] == "gpu" and p[1].is_ascii_digit() and 0 < Int(p[1]) <= len(stacks) and not seen[Int(p[1]) - 1]:
+                            seen[Int(p[1]) - 1] = True
+                            wanted.append(Int(p[1]) - 1)
+        except:
+            pass
         var sites = symbolize(stacks, wanted, roots, maps, dir, pid)
+        for i in range(len(py_held)):  # a GPU block's site, symbolized like the others
+            if py_held[i][0] == "gpu":
+                py_held[i][1] = sites.get(Int(py_held[i][1]) - 1, String("?")) if py_held[i][1].is_ascii_digit() else String("?")
+        var peak = List[Int]()
+        for w in sections[1]:
+            if len(peak) < n_top and not residue(sites.get(w, String("?"))):
+                peak.append(w)
+        sections[1] = peak^
         if sites_out.byte_length() > 0:
             var t = String()
             for w in wanted:
@@ -890,7 +935,7 @@ def main() raises:
         var kept = List[Int]()
         for w in sections[0]:
             var site = sites.get(w, String("?"))
-            var skip = False
+            var skip = residue(site)
             for p in supp:
                 if p in site:
                     skip = True
@@ -937,7 +982,7 @@ def main() raises:
         if as_json:
             if json.byte_length() > 1:
                 json += ","
-            json += String('{"pid":', pid, ',"direct":', leak_d, ',"indirect":', leak_i, ',"growth":"', verdict,
+            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"growth":"', verdict,
                            '","growth_bytes_per_s":', Int(slope), ',"growth_window_bytes":', Int(max(grow, 0.0)),
                            ',"window_from_s":', steady if steady.byte_length() > 0 else String("0"), ',"leaks":[')
             var first = True
@@ -956,6 +1001,9 @@ def main() raises:
                 if len(c) > 0:
                     json += String("" if first else ",", '{"site":', jstr(sites.get(w, String("?"))), ',"held_by":', jstr(held_by(c, sites, roots)), '}')
                     first = False
+            json += '],"py_held":['  # --py: the Python object that holds a top Python site or GPU tensor
+            for i in range(len(py_held)):
+                json += String("," if i else "", '{"kind":', jstr(py_held[i][0]), ',"site":', jstr(py_held[i][1]), ',"held_by":', jstr(py_held[i][2]), '}')
             json += '],"gpu_timeline":['
             for i in range(len(tl_ids)):
                 json += String("," if i > 0 else "", '{"site":', jstr(tl_name(tl_ids[i], stacks, sites)), ',"points":[')
@@ -975,7 +1023,9 @@ def main() raises:
         if name != main_bin and peak_sum < 1 << 20 and leak_d + leak_i < 65536 and verdict != "FAIL":
             quiet.append(pid + " (" + (String(maps[0].path[byte=maps[0].path.rfind("/") + 1 :]) if len(maps) > 0 else String("?")) + ")")
             continue
-        print("== heaptide pid", pid, " exe", maps[0].path if len(maps) > 0 else String("?"), " stacks", n, " samples", nsamp, "every", every, "ms")
+        print("== heaptide pid", pid, "(root)" if is_root else "", " exe", exe, " stacks", n, " samples", nsamp, "every", every, "ms")
+        if cmdline.byte_length() > 0:
+            print("   cmd", cmdline)
         print("LEAKS  direct", human(leak_d), " indirect", human(leak_i))
         for l in leak_lines:
             print(l)
@@ -1016,6 +1066,11 @@ def main() raises:
                 print(f.read())
         except:
             pass
+        if len(py_held) > 0:
+            print("PYTHON HOLDERS (which object holds a site's memory, in Python names)")
+            for h in py_held:
+                print("  ", h[0], " ", h[1])
+                print("      held by:", h[2])
 
     if len(quiet) > 0 and not as_json:
         var q = String()

@@ -1096,8 +1096,8 @@ static void report(int final) {
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
     uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms,
-                       7 | (tl ? 8 : 0) | (attached ? 16 : 0) | 32 | (is_root ? 64 : 0) /* leaked block counts, retention, timeline, then
-                       maps text; attached; the command line after the maps; root */, 0};
+                       7 | (tl ? 8 : 0) | (attached ? 16 : 0) | 32 | (is_root ? 64 : 0) | 128 /* leaked block counts, retention, timeline, then
+                       maps text; attached; the command line after the maps; root; the drop count last */, 0};
     wr(fd, hdr, sizeof hdr);
     wr(fd, ips_arena, ips_used * 8);
     wr(fd, rows + 1, n * sizeof(row_t));
@@ -1115,6 +1115,8 @@ static void report(int final) {
     uint64_t cl[513] = {0};  // {length, /proc/self/cmdline up to 4 KiB}
     if ((in = open("/proc/self/cmdline", O_RDONLY)) >= 0) { ssize_t k = read(in, cl + 1, 4096); cl[0] = k > 0 ? k : 0; close(in); }
     wr(fd, cl, 8 + cl[0]);
+    uint64_t dropped = ndropped;
+    wr(fd, &dropped, 8);
     pwrite(fd, &hdr[7], 8, 56);
     close(fd);
     rename(tmp, path);

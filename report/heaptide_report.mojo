@@ -909,6 +909,10 @@ def main() raises:
         var cl_at = maps_at + nmaps
         if (u64(b, 48) & 32) == 32 and len(b) >= cl_at + 8 and u64(b, cl_at) <= 4096 and len(b) >= cl_at + 8 + Int(u64(b, cl_at)):
             cmdline = String(String(from_utf8_lossy=Span(b)[cl_at + 8 : cl_at + 8 + Int(u64(b, cl_at))]).replace("\x00", " ").strip())
+        var dropped: UInt64 = 0  # since v0.1.8 (flag 128): allocations on new stacks that found no row, a u64 after the command line
+        var dr_at = cl_at + 8 + (Int(u64(b, cl_at)) if (u64(b, 48) & 32) == 32 and len(b) >= cl_at + 8 else 0)
+        if (u64(b, 48) & 128) == 128 and len(b) >= dr_at + 8:
+            dropped = u64(b, dr_at)
         var exe = maps[0].path if len(maps) > 0 else String("?")
         if flame_data or folded >= 0:
             flames.append(flame(stacks, maps, b, smp_at, nsamp, dir, pid, attached, folded))
@@ -1047,7 +1051,7 @@ def main() raises:
         if as_json:
             if json.byte_length() > 1:
                 json += ","
-            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"suppressed_bytes":', sup_b, ',"suppressed_blocks":', sup_n, ',"growth":"', verdict,
+            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"suppressed_bytes":', sup_b, ',"suppressed_blocks":', sup_n, ',"dropped_allocations":', dropped, ',"growth":"', verdict,
                            '","growth_bytes_per_s":', Int(slope), ',"growth_window_bytes":', Int(max(grow, 0.0)),
                            ',"window_from_s":', steady if steady.byte_length() > 0 else String("0"), ',"leaks":[')
             var first = True
@@ -1085,12 +1089,14 @@ def main() raises:
         var peak_sum: UInt64 = 0
         for st in stacks:
             peak_sum += st.peak_b
-        if name != main_bin and peak_sum < 1 << 20 and leak_d + leak_i < 65536 and verdict != "FAIL":
+        if name != main_bin and peak_sum < 1 << 20 and leak_d + leak_i < 65536 and verdict != "FAIL" and dropped == 0:
             quiet.append(pid + " (" + (String(maps[0].path[byte=maps[0].path.rfind("/") + 1 :]) if len(maps) > 0 else String("?")) + ")")
             continue
         print("== heaptide pid", pid, "(root)" if is_root else "", " exe", exe, " stacks", n, " samples", nsamp, "every", every, "ms")
         if cmdline.byte_length() > 0:
             print("   cmd", cmdline)
+        if dropped > 0:
+            print("WARN stack table full:", dropped, "allocations on stacks with no row are in no section below")
         print("LEAKS  direct", human(leak_d), " indirect", human(leak_i))
         if sup_n > 0:
             print("  suppressed", human(sup_b), "in", sup_n, "blocks by the default runtime list")

@@ -181,6 +181,8 @@ cc -O0 -g -o build/c_full tests/c_full.c
 HEAPTIDE_MAXSTACKS=100 run c_full -- build/c_full
 expect c_full stacks "$(sum c_full stacks)" 99
 grep -q "WARN pid=[0-9]* stack table full" "$w/c_full.err" && ok "c_full warns" || bad c_full "no table-full warning ($w/c_full.err)"
+has c_full "WARN stack table full: 201 allocations"
+expect c_full json_dropped "$(./build/heaptide_report "$w/c_full" --json | grep -oE '"dropped_allocations":[0-9]+' | cut -d: -f2)" 201
 # allocator, mapping and report corner cases (an external review's reproducers)
 cc -O0 -g -pthread -o build/c_edge tests/c_edge.c
 for m in zero zerobig errno dlsym count partial fixed peak; do rc=0; (ulimit -c 0; exec ./heaptide run --out "$w/edge_$m" -- build/c_edge $m > "$w/edge_$m.out" 2> "$w/edge_$m.err") || rc=$?; expect edge_$m exit "$rc" 0; done

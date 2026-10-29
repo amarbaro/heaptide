@@ -277,6 +277,7 @@ def resolve_frames(ips: List[UInt64], roots: List[UInt64], maps: List[Mapping], 
     var offs = List[UInt64]()  # module-relative address: names a frame no symbol table covers
     for ip in ips:
         var q = len(mods)
+        var in_file = False  # not for/else: Mojo 1.2.0 at -O3 skips that else (py:: frames lost)
         for mi in range(len(maps)):
             ref m = maps[mi]
             if ip >= m.start and ip < m.end:
@@ -291,8 +292,9 @@ def resolve_frames(ips: List[UInt64], roots: List[UInt64], maps: List[Mapping], 
                     mods.append(String(m.path[byte=m.path.rfind("/") + 1 :]))
                     pys.append(String())
                     offs.append(ip - (0 if fixed[mi] else m.start))
+                in_file = True
                 break
-        else:  # in no file: a perf-map stub is a Python function
+        if not in_file:  # in no file: a perf-map stub is a Python function
             for pi in range(len(p_lo)):
                 if ip >= p_lo[pi] and ip < p_hi[pi]:
                     req += '"' + maps[0].path + '" 0x0\n'

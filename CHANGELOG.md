@@ -2,6 +2,7 @@
 
 Full notes in `docs/releases/`. Newest first.
 
+- Unreleased: a full stack table is now in the saved file and the report (a `WARN stack table full: N allocations` line, JSON `dropped_allocations`; flag bit 7 in `docs/file-format.md`).
 - [v0.1.7](docs/releases/v0.1.7.md) (2026-10-30): runs on glibc before 2.34, default ROCm suppression list and 200x faster report symbolization, stack table clamp with warning, `py::` frames under Mojo 1.2.0
 - [v0.1.6](docs/releases/v0.1.6.md) (2026-10-26): Python holder chains, per-process reports with --no-children/--only, snapshot --label, attach mmap crash and fork timeline fixed, --py sys.exit() and -c
 - [v0.1.5](docs/releases/v0.1.5.md) (2026-10-12): interactive flame graph (`heaptide flame`), Python mode ~10x faster (memray-style hooks), detach without restart, attach safe on own allocators (Chromium hang and crash fixed), Qt/QML heaps

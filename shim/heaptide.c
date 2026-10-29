@@ -335,10 +335,16 @@ static void *boot_alloc(size_t n) {
   void *p = boot + boot_used; boot_used += n; return p;
 }
 
+// dlsym's own version: GLIBC_2.34 merged libdl into libc; older ones have only the base version
+static void find_dlsym(void) {
+  static const char *ver[] = {"GLIBC_2.34", "GLIBC_2.2.5", "GLIBC_2.17", "GLIBC_2.0"};
+  for (size_t i = 0; !r_dlsym && i < sizeof ver / sizeof *ver; i++) r_dlsym = dlvsym(RTLD_NEXT, "dlsym", ver[i]);
+}
+
 static void *scope = RTLD_NEXT;  // attached: RTLD_DEFAULT (see attach)
 static void *next(const char *name) {
-  if (!r_dlsym) r_dlsym = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
-  return r_dlsym(scope, name);
+  if (!r_dlsym) find_dlsym();
+  return r_dlsym ? r_dlsym(scope, name) : 0;
 }
 
 // Other libraries' constructors can allocate before ours runs: resolve on first use, and serve
@@ -524,7 +530,7 @@ HOOK void *dlsym(void *h, const char *name) {
   static const struct { const char *n; void *f; } ours[] = {
       {"hipMalloc", hipMalloc}, {"hipMallocAsync", hipMallocAsync}, {"hipHostMalloc", hipHostMalloc},
       {"hipFree", hipFree},     {"hipHostFree", hipHostFree},       {"hipFreeAsync", hipFreeAsync}};
-  if (!r_dlsym) r_dlsym = dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+  if (!r_dlsym) find_dlsym();
   if (!r_dlsym) return 0;  // asked before libdl answers (ASan's init, run by the loader): not found
   for (size_t i = 0; i < sizeof ours / sizeof *ours; i++)  // ours only where the real one exists
     if (same(name, ours[i].n)) {

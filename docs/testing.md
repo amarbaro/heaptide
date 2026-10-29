@@ -1,9 +1,13 @@
 # Testing
 
-`tests/run.sh` builds everything and runs 216 checks against programs with planted bugs. Where a
+`tests/run.sh` builds everything and runs 218 checks against programs with planted bugs. Where a
 standard tool can answer the same question, its answer is the oracle: heaptrack for leaked
 allocation counts, LeakSanitizer (`clang -fsanitize=leak`) for the direct/indirect split and
 reachability. The script prints `PASS N/N`, or `FAIL k/N <names>` and exits non-zero.
+
+Last full pass (218/218, GPU included): Mojo `1.3.0.dev2026102914` with max `26.8.0.dev2026102914`
+(keep both on one nightly date). Mojo 1.2.0 stable builds a report that loses `py::` frames at
+`-O3` unless the source avoids `for ... else` (it does since `0ccce85`).
 
 ```
 tests/run.sh                    # everything, GPU included: PASS 216/216

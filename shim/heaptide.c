@@ -144,7 +144,14 @@ static void *vm(size_t n) {  // raw syscall: our own memory never passes the mma
 // 2 MiB page (sleep: +7.2 MB RSS, now +1.1 MB). Hash tables and scan arrays keep huge pages (TLB).
 static void *cold(size_t n) { void *p = vm(n); if (p) syscall(SYS_madvise, p, n, MADV_NOHUGEPAGE); return p; }
 static uint64_t mix(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; return x; }
-static void lock(atomic_flag *f) { while (atomic_flag_test_and_set_explicit(f, memory_order_acquire)) ; }
+static void lock(atomic_flag *f) {
+  // a preempted holder must not cost each waiter its whole time slice
+  for (unsigned i = 1; atomic_flag_test_and_set_explicit(f, memory_order_acquire); i++)
+    if (i % 64 == 0) syscall(SYS_sched_yield);
+#if defined(__x86_64__)
+    else __builtin_ia32_pause();
+#endif
+}
 static void unlock(atomic_flag *f) { atomic_flag_clear_explicit(f, memory_order_release); }
 
 static ent_t *slot(tab_t *s, uint64_t k) {

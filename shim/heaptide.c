@@ -58,6 +58,7 @@ static tab_t live[SHARDS], stacks[SHARDS];
 static row_t *rows;
 static uint64_t *ips_arena, (*samples)[3];
 static _Atomic uint32_t nstacks;
+static _Atomic uint64_t ndropped;  // new stacks counted under id 0: row table or frame arena full
 static _Atomic uint64_t ips_used, nsamples, peak_mark;
 static uint32_t maxstacks = MAXSTACKS;  // smaller under an address-space limit (ulimit -v)
 static uint64_t ips_cap = (uint64_t)1 << 30;  // frames
@@ -209,14 +210,17 @@ static uint32_t intern(void **ips, int d, int kind) {
     if (id) *hit = (__typeof__(*hit)){h0, (uint32_t)c, id};
     if (!id) {  // a new stack; when the row or frame arena is full it counts under id 0
       uint64_t off = 0;
-      if ((id = atomic_fetch_add(&nstacks, 1) + 1) >= maxstacks) id = 0;
+      // never past maxstacks: an unbounded add wraps on a long run and hands out ids in use
+      uint32_t cur = atomic_load(&nstacks);
+      do id = cur + 1 < maxstacks ? cur + 1 : 0; while (id && !atomic_compare_exchange_weak(&nstacks, &cur, id));
+      if (!id) ;
       else if ((off = atomic_fetch_add(&ips_used, d)) + d > ips_cap) atomic_fetch_sub(&ips_used, d), id = 0;
       if (id) {
         memcpy(ips_arena + off, ips, d * sizeof(void *));
         rows[id].ips_off = off; rows[id].depth = d; rows[id].kind = kind;
         if (tl_parts && (kind == GPU || kind == HOST) && ngids < 4096) gids[atomic_fetch_add(&ngids, 1) % 4096] = id;
         put(s, h, c << 32 | id);
-      }
+      } else atomic_fetch_add_explicit(&ndropped, 1, memory_order_relaxed);
     }
     unlock(&s->lk);
     return id;
@@ -1118,6 +1122,7 @@ static void report(int final) {
   dprintf(2, "heaptide: %spid=%d direct=%lu indirect=%lu live_cpu=%lu live_gpu=%lu live_host=%lu live_mmap=%lu temps=%lu stacks=%u threads=%d/%d -> %s/heaptide.%d.bin\n",
           final ? "" : "snapshot ", pid, sum[0], sum[1], live_total(CPU), live_total(GPU), live_total(HOST), live_total(MMAP), sum[2], n,
           scanned, nthr, outdir, pid);
+  if (ndropped) dprintf(2, "heaptide: WARN pid=%d stack table full: %lu allocations on new stacks merged into one unnamed site the report leaves out\n", pid, (unsigned long)ndropped);
   if (!final && !child) _exit(0);  // the snapshot fork
   finished = final;
   unvm(segs, 4096 * 16); unvm(all, (total + 1) * 8); unvm(mmv, (nmm + nd + 1) * 16);
@@ -1442,6 +1447,7 @@ __attribute__((constructor)) static void init(void) {
   struct rlimit as;
   for (; !getrlimit(RLIMIT_AS, &as) && as.rlim_cur != RLIM_INFINITY && maxstacks > 4096 &&
          maxstacks * sizeof(row_t) + ips_cap * 8 > as.rlim_cur / 4;) maxstacks /= 2, ips_cap /= 2;
+  { const char *m = getenv("HEAPTIDE_MAXSTACKS"); if (m && atoi(m) > 1 && (uint32_t)atoi(m) < maxstacks) maxstacks = atoi(m); }  // tests only
   rows = cold((size_t)maxstacks * sizeof(row_t));
   ips_arena = cold(ips_cap * 8);
   samples = cold((size_t)MAXSAMPLES * 24);

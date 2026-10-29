@@ -12,7 +12,7 @@ Security problems go through private reporting instead, see [SECURITY.md](SECURI
 
 ## Send a change
 
-1. Build: `./build.sh` (needs a C compiler, `libunwind`, Mojo 1.1; see the README).
+1. Build: `./build.sh` (needs a C compiler, `libunwind`, Mojo 1.2 or newer; see the README).
 2. Test: `tests/run.sh --cpu` must print `PASS N/N`, and `tools/ci-local.sh` (the CI workflow in
    an Ubuntu container, about a minute once its image is built) must print `ci-local: OK`. If you
    touch GPU paths and have ROCm, run `tests/run.sh` too and say so in the pull request.

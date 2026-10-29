@@ -7,8 +7,8 @@ here=$(cd "$(dirname "$0")" && pwd); mkdir -p "$here/build"
 cc -O2 -g -Wall -Wextra -fPIC -shared -fvisibility=hidden -o "$here/build/libheaptide.so" "$here/shim/heaptide.c" -lunwind -ldl -lpthread \
   || { echo "FAIL build: libheaptide.so" >&2; exit 1; }
 echo "built $here/build/libheaptide.so"
-mojo=${MOJO:-$(command -v mojo || ls "$here/.venv/bin/mojo" 2>/dev/null || true)}
-[[ -n $mojo ]] || { echo "FAIL build: no mojo toolchain (put mojo on PATH, in ./.venv, or set MOJO=)" >&2; exit 1; }
+mojo=${MOJO:-$(ls "$here/.venv/bin/mojo" 2>/dev/null || command -v mojo || true)}  # the repo's own toolchain first: PATH may hold another repo's
+[[ -n $mojo ]] || { echo "FAIL build: no mojo toolchain (put mojo in ./.venv, on PATH, or set MOJO=)" >&2; exit 1; }
 # into a temp file: a failed build must not leave the old binary looking fresh. Mojo's crashpad
 # trace is noise, the compiler's exit status is not.
 tmp=$here/build/.heaptide_report.new; rm -f "$tmp"; rc=0

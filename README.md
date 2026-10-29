@@ -89,8 +89,8 @@ tar xzf heaptide-v0.1.4-linux-x86_64.tar.gz && cd heaptide-v0.1.4-linux-x86_64 &
 
 ## Build from source
 
-You need Linux x86-64, a C compiler, `libunwind` and Mojo 1.1 for the report (on `PATH`, in
-`./.venv`, or `MOJO=`). For file:line the report needs `llvm-symbolizer`: it uses
+You need Linux x86-64, a C compiler, `libunwind` and Mojo 1.1 for the report (in `./.venv`,
+on `PATH`, or `MOJO=`; `./.venv` wins over `PATH`). For file:line the report needs `llvm-symbolizer`: it uses
 `$HEAPTIDE_SYMBOLIZER`, then the one on `PATH`, then ROCm's. Without any, sites show module names
 only.
 

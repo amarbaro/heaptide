@@ -263,6 +263,9 @@ static int unw_ready(void) {
 __attribute__((always_inline)) static inline uint32_t stack_id(int kind) {  // inlined: one less frame to unwind
   // no unwind yet: a stackless row of its own, so the exit scan still reads the block as a mapping
   if (kind == MMAP && !unw_ready()) return intern((void *[1]){0}, 0, kind);
+#ifdef HT_NO_UNWIND  // bench only: what the hooks cost without the unwind
+  return intern((void *[1]){0}, 0, kind);
+#endif
   void *buf[DEPTH + 4], **ips = buf;
   int max = kind == GPU || kind == HOST ? DEPTH : depth;  // device buffers are few and big: the whole stack, to
   int d = unw_backtrace(buf, max + 4);                    // the Python line under torch's C++ even with --py

@@ -8,6 +8,8 @@ object with `"root": true` (the first traced process) or the one with the most l
  "direct", "indirect",                         // leaked bytes, whole process
  "suppressed_bytes", "suppressed_blocks",      // dropped by the default runtime list
  "dropped_allocations",                        // > 0: the stack table was full, totals are a lower bound
+ "ended_without_report",                       // true: killed or _exit; written afterwards, no leak scan
+ "before_attach_bytes",                        // attached: glibc heap in use at attach, the most it can miss
  "growth": "PASS|FAIL|too short|attached", "growth_bytes_per_s", "growth_window_bytes", "window_from_s",
  "leaks":  [{"bytes", "direct", "indirect", "blocks", "kind": "cpu|gpu|host|mmap", "site"}],
  "held":   [{"site", "held_by"}],              // "make_table x.c:7 << global g_cache"

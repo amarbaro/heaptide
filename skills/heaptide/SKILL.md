@@ -39,10 +39,10 @@ the stable interface. `scripts/ht.sh` wraps the loop below and prints one line p
 - Build C/C++ with `-g`, Mojo with `-g1`; without symbols, sites stop at `[module+0xoffset]`.
 - `--gpu` for every Mojo GPU program (Mojo pools buffers otherwise: one block).
 - Short runs: `--every 20` under a few seconds, or GROWTH says `too short`.
-- SIGKILL and the OOM killer write nothing: add `--snapshot-every 60` to long jobs.
-- A process that leaves through `_exit()` (dash, Ubuntu's `sh`) writes no report: use `bash -c`.
+- SIGKILL, the OOM killer and `_exit()` still give a report (`ENDED WITHOUT A REPORT`: no leak scan,
+  PEAK names what it held). If the kill took the wrapper too, `heaptide report DIR` writes it.
 - Run GPU jobs through the project's GPU scheduler; heaptide does not queue.
-- Never attach to a browser in use; attached runs can under-report, never over-report.
+- Never attach to a browser in use; attached runs under-report by at most the `before attach:` bytes.
 
 ## Reporting back
 

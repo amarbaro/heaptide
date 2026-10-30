@@ -1,6 +1,6 @@
 # Testing
 
-`tests/run.sh` builds everything and runs 226 checks against programs with planted bugs. Where a
+`tests/run.sh` builds everything and runs 232 checks against programs with planted bugs. Where a
 standard tool can answer the same question, its answer is the oracle: heaptrack for leaked
 allocation counts, LeakSanitizer (`clang -fsanitize=leak`) for the direct/indirect split and
 reachability. The script prints `PASS N/N`, or `FAIL k/N <names>` and exits non-zero.
@@ -84,6 +84,8 @@ older CPU (it caught a report built for the build machine's CPU) and under WSL2 
 | `py_deep.py` | a leak two Python calls deep, `--py-depth 2` | PYTHON site `py_deep.py:4 <- py_deep.py:6` |
 | `python -c` under `HEAPTIDE_PY_MEM=1` | 200,000 live tuples, the `--py` live table capped at 1 MiB | exit 0; PYTHON starts with `WARN untracked:` and names the cap (`capped at 1 MiB`) |
 | `skills/heaptide/scripts/ht.sh` | `run` on `c_leak`, `prove` against `/usr/bin/true`, `run` into a directory holding another file | the leak line `leak 100000 B cpu lose c_leak.c`; `100005 -> 0 B  lose c_leak.c`; the other file kept |
+| `c_kill.c` | 64 MiB at `big_alloc`, then `kill -9`; with an argument it leaves through `_exit()` | `ENDED WITHOUT A REPORT` in both; PEAK `67108864 cpu big_alloc c_kill.c`; no `/dev/shm/heaptide.*` left |
+| `c_attach.c` (bound) | the same attach run | `before attach:` line; JSON `before_attach_bytes` >= 520 (its holder and table) |
 | `hip_leak.hip` | 5 MiB of `hipMalloc` never freed | live GPU 5242880 at `hip_leak.hip:4` |
 | `mojo_leak.mojo` | a 4 MiB device buffer leaked | live GPU 4194304 at `mojo_leak.mojo:8` |
 

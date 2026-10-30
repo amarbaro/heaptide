@@ -131,8 +131,12 @@ GPU targets need ROCm/HIP. Python mode hooks CPython's own allocators (no `trace
   snapshot pauses the program only to fork it (10M live blocks: 15 ms) and scans the copy, which
   can cost up to the heap's size in memory while the program rewrites its pages; it is skipped if
   a thread cannot be parked.
-- A process that leaves through `_exit()` writes no report, since exit handlers do not run (dash, Ubuntu's `sh`,
-  does this: trace `bash -c` instead).
+- A process that ends without its report (SIGKILL, the OOM killer, or `_exit()` as dash and Ubuntu's `sh` do)
+  still gets one. The site tables live in a sparse file in `/dev/shm`, which outlives the process; the wrapper
+  turns it into `heaptide.<pid>.bin` after the run, and `heaptide report DIR` does too (systemd stops a whole
+  unit on OOM, the wrapper with it). The heap is gone by then, so there is no leak scan: the report says
+  `ENDED WITHOUT A REPORT` and PEAK names what the process held (a `--py` job killed at `MemoryMax=300M`:
+  `py::grow oomk.py`, 302 MB). Without `/dev/shm` the tables are anonymous memory, as before.
 - A crash (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT) writes the report, then the process dies of
   the signal; best effort, since the heap may be broken (it gives up after 10 s).
 - `report --growth-limit MIB` fails GROWTH on a projected rise above MIB, whatever the mean.
@@ -207,7 +211,9 @@ direct, 6,400 B indirect). Memcheck also catches invalid reads and writes, which
 look for. Reproduce with `bench/vs_valgrind.sh` (2026-10-12, load 1.4, 3 runs each).
 
 That is still about 6x slower than no tool on an allocation-bound loop (load average 3 during the
-runs). Python mode, on `bench/py_bench.py` (8M live objects, 17M allocations, bare 0.9 s / 569 MB):
+runs). The cost per call is spread out: unwinding about 37%, the live table about 15%, the per-site
+counters about 20%, the hook itself the rest (measured with the `HT_NO_UNWIND` build knob; keeping a
+thread's newest block out of the table gained 7% and was not kept). Python mode, on `bench/py_bench.py` (8M live objects, 17M allocations, bare 0.9 s / 569 MB):
 2.9 s / 849 MB, against memray `--trace-python-allocators` at 2.8 s / 617 MB (memray streams to a
 file, heaptide keeps a table). Before v0.1.5 it ran under `tracemalloc`: 30 s / 3.86 GB.
 
@@ -216,12 +222,12 @@ Internals: [docs/how-it-works.md](docs/how-it-works.md). File format:
 
 ## Every claim above has a check
 
-`tests/run.sh` runs 216 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
+`tests/run.sh` runs 232 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
 exact leak bytes, file:line, the direct/indirect split, mmap regions, blocks held only by a
 thread's stack or register, interior pointers, fork, reserve-then-commit mappings, growth after a
 long setup, Python lines, HIP and Mojo GPU leaks, Mojo's CPU heap, who holds reachable memory, ASan
 programs, attaching to a running process, `diff`, the GPU timeline and Python frames in native
-stacks. `tests/run.sh --cpu` runs the 162 that need
+stacks. `tests/run.sh --cpu` runs the 227 that need
 no GPU; CI runs those on Ubuntu 24.04 for every push.
 [docs/testing.md](docs/testing.md) lists them.
 
@@ -246,8 +252,8 @@ Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/skills/heaptide
 - A `PROT_NONE` reservation counts only the parts `mprotect` commits, each as a block at the
   `mprotect` call; `mprotect(PROT_NONE)` decommits. After `madvise(MADV_DONTNEED|MADV_FREE)`
   only the pages resident at report time count. A reservation moved with `mremap` is followed.
-- SIGKILL (and the OOM killer) writes no report: use `--snapshot-every` on anything that may die
-  that way. A stack overflow writes a report only in the main thread or a thread that has
+- After SIGKILL or the OOM killer the report has no leak scan (see above); `--snapshot-every` still
+  gives full snapshots before the end. A stack overflow writes a report only in the main thread or a thread that has
   allocated (each gets a 64 KiB signal stack, mapped but untouched until a crash).
 - A forked child treats the parent's blocks as reachable roots, so it reports only its own leaks
   (LeakSanitizer reports the parent's again in the child). Stack ids are a 64-bit hash plus a
@@ -274,7 +280,9 @@ Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/skills/heaptide
   every already-bound GOT slot of a hooked function at heaptide's. It sees only what is allocated
   after attach. Memory from before attach is scanned as a root (minus the blocks tracked since),
   so nothing from before shows as a leak, but a stale pointer there can hide a newer one: an
-  attached report can under-report, never over-report. Mojo's heap stays invisible when attached
+  attached report can under-report, never over-report. It says by how much at most: `before attach:
+  N in use in the glibc heap, not tracked` (glibc 2.33+, `mallinfo2`; JSON `before_attach_bytes`).
+  Mojo's heap stays invisible when attached
   (its allocator switch only works before the first allocation). Under Yama `ptrace_scope` 1 it
   needs `sudo`, or a process that called `prctl(PR_SET_PTRACER, ...)`; `heaptide snapshot DIR`
   then works as for `run`. An attached report has no GROWTH verdict (`GROWTH n/a`, JSON

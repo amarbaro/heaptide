@@ -11,6 +11,8 @@
 | `WARN stack table full: N allocations` (JSON `dropped_allocations`) | more distinct stacks than the table holds; those allocations are in no site | totals are a lower bound: lower `HEAPTIDE_DEPTH` or shorten the run |
 | `WARN untracked: N blocks` in PYTHON (`--py`) | the live Python table reached its cap (1/8 of free memory, `HEAPTIDE_PY_MEM` MiB) | PYTHON is a lower bound; raise the cap only with memory to spare |
 | GROWTH FAIL, few direct leaks | memory held, not lost: caches, queues, pools | read `held`: the chain from the site to a global, a thread's stack, or memory from before attach |
+| `ENDED WITHOUT A REPORT` (JSON `ended_without_report`) | killed (SIGKILL, OOM killer) or `_exit`; written afterwards from its tables | no leak scan: read PEAK, the site on top is what filled memory |
+| `before attach: N` | the glibc heap held N at attach, no site can show it | leaks and sites are a lower bound by up to N |
 | GROWTH `too short` | fewer than 5 samples | run longer or lower `--every` |
 | GROWTH `attached` (text `n/a`) | live bytes count from 0 at attach | snapshot twice under load, then `heaptide diff A B` |
 

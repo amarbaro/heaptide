@@ -24,6 +24,16 @@ With `--py`, `py.<pid>.txt` adds the PYTHON section as text.
 | ... | field 7 | `/proc/self/maps` text (only when header field 6 has bit 1 set) |
 | ... | 8 + `len` | u64 `len`, then `/proc/self/cmdline` up to 4 KiB (only when header field 6 has bit 5 set) |
 | ... | 8 | allocations on new stacks that found no row (table or frame arena full), counted under no site (only when header field 6 has bit 7 set) |
+| ... | 8 | bytes the glibc heap held at attach, `mallinfo2()` `uordblks + hblkhd`, 0 when unknown (only when bits 7 and 9 are set) |
+
+## `/dev/shm/heaptide.<uid>.<pid>`
+
+While a process runs, its header (counters, pid, `--out`, command line, a copy of `/proc/self/maps`
+kept current when a library loads), thread slots, rows, frames and samples live in this sparse
+tmpfs file, `MAP_SHARED`, each part page aligned (`shm_at()` in `shim/heaptide.c`). A clean report
+deletes it. If it is left behind, the wrapper runs `HEAPTIDE_POSTMORTEM=FILE` with the shim
+preloaded into `/usr/bin/true`, which maps it as its own tables and writes the `.bin` above with
+bit 8 set.
 
 Header (u64 each):
 
@@ -35,7 +45,7 @@ Header (u64 each):
 | 3 | `nips`, number of instruction pointers |
 | 4 | `nsamples` |
 | 5 | sampling period in ms |
-| 6 | flags: bit 0 = leaked block counts follow the samples (since v0.1.2; older files: the report shows live blocks); bit 1 = maps text ends the file (since v0.1.3); bit 2 = the retention array follows the leaked block counts (since v0.1.4); bit 3 = the GPU timeline follows it (`--gpu-timeline`, since v0.1.4); bit 4 = written by an attached process (since v0.1.5: no growth verdict); bit 5 = the command line follows the maps (since v0.1.6); bit 6 = the run's first traced process (since v0.1.6); bit 7 = the drop count ends the file (since v0.1.8) |
+| 6 | flags: bit 0 = leaked block counts follow the samples (since v0.1.2; older files: the report shows live blocks); bit 1 = maps text ends the file (since v0.1.3); bit 2 = the retention array follows the leaked block counts (since v0.1.4); bit 3 = the GPU timeline follows it (`--gpu-timeline`, since v0.1.4); bit 4 = written by an attached process (since v0.1.5: no growth verdict); bit 5 = the command line follows the maps (since v0.1.6); bit 6 = the run's first traced process (since v0.1.6); bit 7 = the drop count ends the file (since v0.1.8); bit 8 = written after the process ended without its report, from its `/dev/shm` tables: no leak scan (since v0.1.8); bit 9 = attached: the bytes in use before attach follow the drop count (since v0.1.8) |
 | 7 | length of the maps text in bytes (0 without bit 1) |
 
 Row (56 B, `row_t` in `shim/heaptide.c`, size fixed by a static assert):

@@ -37,7 +37,8 @@ heaptide snapshot .work/ht [--label NAME]    # every traced process writes its r
 heaptide detach .work/ht                     # last snapshot, then the process runs on untracked
 ```
 
-- Sees only what is allocated after attach: can under-report, never over-report.
+- Sees only what is allocated after attach: can under-report, never over-report. The report says by
+  how much at most: `before attach: N in use in the glibc heap` (JSON `before_attach_bytes`).
 - GROWTH reads `attached`: compare two snapshots with `heaptide diff` instead.
 - A snapshot pauses the program for milliseconds and never interrupts a thread asleep in a
   syscall; a block held only in such a thread's registers can show as leaked (never at exit).
@@ -47,8 +48,10 @@ heaptide detach .work/ht                     # last snapshot, then the process r
 
 - Children are traced, one report section each, named by command; `--no-children` or
   `--only NAME[,NAME]` narrow it. A forked child keeps the parent's tables until exec.
-- SIGTERM / Ctrl-C and crashes still write the report; SIGKILL and the OOM killer do not
-  (`--snapshot-every S`).
+- SIGTERM / Ctrl-C and crashes write the full report. SIGKILL, the OOM killer and `_exit()` leave
+  the tables in `/dev/shm`; the wrapper (or `heaptide report DIR`) writes a report from them:
+  `ENDED WITHOUT A REPORT`, JSON `ended_without_report`, no leak scan. `--snapshot-every S` still
+  gives full snapshots before the end.
 
 ## Builds and limits
 

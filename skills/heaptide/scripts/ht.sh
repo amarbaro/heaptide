@@ -21,6 +21,8 @@ summary() {
   [[ -s $d/report.json ]] || report "$d"
   jq -r '.[] | "pid \(.pid) \(.exe | split("/") | last)\(if .root then " (root)" else "" end): direct \(.direct) B, indirect \(.indirect) B, growth \(.growth)"
       + (if (.growth_window_bytes // 0) > 0 then " (+\(.growth_window_bytes) B over the window)" else "" end)
+      + (if .ended_without_report then "\n  WARN ended without a report (killed or _exit): no leak scan, the held sites are what it had" else "" end)
+      + (if (.before_attach_bytes // 0) > 0 then "\n  WARN before attach: \(.before_attach_bytes) B untracked, sites under-report by up to this" else "" end)
       + (if (.dropped_allocations // 0) > 0 then "\n  WARN stack table full: \(.dropped_allocations) allocations in no site" else "" end)
       + (if (.suppressed_blocks // 0) > 0 then "\n  suppressed \(.suppressed_bytes) B in \(.suppressed_blocks) runtime blocks" else "" end)
       + ([.leaks[] | select(.direct > 0)] | sort_by(-.direct) | .[:5] | map("\n  leak \(.direct) B \(.kind) \(.site)") | join(""))

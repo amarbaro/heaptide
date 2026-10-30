@@ -183,6 +183,15 @@ expect c_full stacks "$(sum c_full stacks)" 99
 grep -q "WARN pid=[0-9]* stack table full" "$w/c_full.err" && ok "c_full warns" || bad c_full "no table-full warning ($w/c_full.err)"
 has c_full "WARN stack table full: 201 allocations"
 expect c_full json_dropped "$(./build/heaptide_report "$w/c_full" --json | grep -oE '"dropped_allocations":[0-9]+' | cut -d: -f2)" 201
+# the skill's helper: a capped run names the leak, prove shows it gone against a clean program
+ht=skills/heaptide/scripts/ht.sh; rm -rf "$w/sk_a" "$w/sk_b"
+"$ht" run "$w/sk_a" -- build/c_leak > "$w/sk_a.txt" 2>&1 || true
+grep -q "leak 100000 B cpu lose c_leak.c" "$w/sk_a.txt" && ok "ht.sh run names the leak" || bad ht_run "no leak line ($w/sk_a.txt)"
+"$ht" run "$w/sk_b" -- /usr/bin/true > /dev/null 2>&1 || true
+"$ht" prove "$w/sk_a" "$w/sk_b" > "$w/sk_prove.txt" 2>&1 || true
+grep -q "^100005 -> 0 B  lose c_leak.c" "$w/sk_prove.txt" && ok "ht.sh prove 100005 -> 0" || bad ht_prove "no before/after line ($w/sk_prove.txt)"
+mkdir -p "$w/sk_mine" && touch "$w/sk_mine/notes"; "$ht" run "$w/sk_mine" -- true > /dev/null 2>&1 || true
+[[ -e $w/sk_mine/notes ]] && ok "ht.sh run keeps a foreign DIR" || bad ht_guard "deleted $w/sk_mine"
 # allocator, mapping and report corner cases (an external review's reproducers)
 cc -O0 -g -pthread -o build/c_edge tests/c_edge.c
 for m in zero zerobig errno dlsym count partial fixed peak; do rc=0; (ulimit -c 0; exec ./heaptide run --out "$w/edge_$m" -- build/c_edge $m > "$w/edge_$m.out" 2> "$w/edge_$m.err") || rc=$?; expect edge_$m exit "$rc" 0; done

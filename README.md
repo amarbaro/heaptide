@@ -228,9 +228,11 @@ no GPU; CI runs those on Ubuntu 24.04 for every push.
 ## For coding agents
 
 [`skills/heaptide/SKILL.md`](skills/heaptide/SKILL.md) teaches an agent the loop: reproduce small,
-run, read `report --json`, fix the top direct leak, re-run to prove it. It also tells the agent
-which findings are runtime residue to suppress. Copy or symlink the folder into the agent's skills
-directory (for Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/skills/heaptide`).
+run under a memory cap, read `report --json`, fix the top direct leak, re-run to prove it. It routes
+by question (leak, growth, holders, VRAM, Python, attach, CI) to short files in `references/`, loaded
+only when needed. `scripts/ht.sh` does the loop in three commands (`run`, `summary`, `prove`) with one
+line per finding, warnings first. Copy or symlink the folder into the agent's skills directory (for
+Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/skills/heaptide`); it needs `jq`.
 
 ## Where it is wrong
 

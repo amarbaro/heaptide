@@ -1,134 +1,50 @@
 ---
 name: heaptide
-description: Find and fix memory leaks and memory growth in CPU, GPU (HIP, Mojo) and Python programs on Linux with heaptide, a preload profiler that needs no rebuild. Use when a process's memory grows, when a run must be proven leak-free, when VRAM is not returned, when asked who holds memory, when a running service must be profiled without a restart, or when a change must be gated against its base in CI. Covers running and attaching, reading the JSON report (leaks, holders, GPU timeline), diffing two runs, telling real leaks from runtime residue, and proving a fix.
+description: Find, explain and prove fixes for memory leaks and memory growth in CPU, GPU (HIP, Mojo) and Python programs on Linux with heaptide, a preload profiler that needs no rebuild. Use when a process's memory or VRAM keeps growing, when a run must be shown leak-free, when asked who holds memory, when a running service must be profiled without a restart, when a Python job's RSS balloons, or when a change must be gated against its base in CI.
 ---
 
 # heaptide
 
-heaptide is preloaded into an unmodified program. At exit it writes one file per process; `heaptide
-report` turns that into LEAKS, GROWTH, PEAK, HOTSPOTS, TEMPORARIES (and PYTHON with `--py`). Read the
-JSON, not the text: it is the stable interface.
+Preloaded into an unmodified program; one file per process at exit; `heaptide report --json` is
+the stable interface. `scripts/ht.sh` wraps the loop below and prints one line per finding.
+
+## Route by the question
+
+| The user asks | Do | Read |
+|---|---|---|
+| "does it leak?" / "is it clean?" | `ht.sh run .work/ht -- CMD`, fix the top direct leak, `ht.sh prove` | [triage](references/triage.md) |
+| "memory keeps growing" (no leak shown) | a longer steady run, then `held` chains; for a service, two snapshots + `diff` | [triage](references/triage.md) § growth |
+| "who holds this memory?" | `held` (native) and `py_held` (`--py`, Python names) | [json](references/json.md) |
+| "VRAM is not given back" | `--gpu --gpu-timeline all` | [runtimes](references/runtimes.md) § GPU |
+| a Python job | `--py`, add `--py-depth 4` for shared helpers | [runtimes](references/runtimes.md) § Python |
+| a running process, no restart | `attach` / `snapshot` / `detach` | [runtimes](references/runtimes.md) § attach |
+| "gate this PR on leaks" | two runs + `heaptide diff --fail-on new` | [ci](references/ci.md) |
 
 ## The loop
 
-1. **Reproduce small.** The shortest run that still shows the symptom. GROWTH needs repetition:
-   loop the suspect operation (requests, iterations, batches) many times, so setup is under half
-   the run.
-2. **Run.**
-   ```
-   heaptide run [--gpu] [--py] [--py-depth N] [--every MS] [--gpu-timeline all] --out .work/ht -- <cmd> <args>
-   heaptide report .work/ht --json > .work/ht/report.json
-   heaptide flame .work/ht --open      # for a person: every call path as an offline flame graph
-   ```
-   - Already running and must not restart: `sudo heaptide attach PID --out .work/ht` (gdb loads
-     heaptide into it), then `heaptide snapshot .work/ht`. It sees only what is allocated after
-     attach and can under-report (never over-report); Mojo's heap stays invisible when attached.
-     Done: `heaptide detach .work/ht` (last snapshot, then untracked; no restart, no sudo).
-     Chromium-based browsers: only shared libraries' allocations are seen (PartitionAlloc is
-     called directly); a pre-v0.1.5 attach could hang them. Never attach to a browser in use.
-   - `--gpu-timeline all` (or `sites,streams,frag`) when the question is which GPU site filled VRAM
-     when, per HIP stream, or how much the device holds beyond live blocks.
-   - Build C/C++ with `-g` and Mojo with `-g1` (full `-g` can fail on large kernels), or sites
-     stop at the executable's symbol.
-   - `--gpu` for any Mojo GPU program. Without it Mojo pools its buffers and you see one block.
-   - `--py` for a Python entry point (the command must be `python...`; GIL builds only, about
-     memray's speed). On Python 3.12+ native and
-     GPU sites end in the Python function that made them (`<- py::load_weights train.py`); the
-     report must run on the same machine (it reads `/tmp/perf-<pid>.map`). Add `--py-depth 4` when
-     one helper is called from many places: PYTHON then shows each call chain, not one line.
-   - Child processes are traced too, each in its own report section named by its command;
-     `--no-children` traces the command alone, `--only NAME[,NAME]` only those process names.
-     A process that leaves through `_exit()` (dash, Ubuntu's `sh`) writes no report: run `bash -c`.
-   - `heaptide snapshot .work/ht --label NAME` keeps that moment's reports in `.work/ht/NAME`
-     (before/after pairs for `heaptide diff`).
-   - Short runs need a faster sampler or GROWTH says `too short`: `--every 20` under a few
-     seconds, `--every 1` under one second.
-   - Servers and long jobs: stop them with SIGTERM or Ctrl-C (the report is still written), or
-     leave them running and call `heaptide snapshot .work/ht`, then `heaptide report`. Two
-     snapshots under the same load show what grew between them (a snapshot pauses the program
-     for milliseconds). A crash writes the report too; SIGKILL and the OOM killer write
-     nothing: add `--snapshot-every 60`.
-3. **Read** `report.json`: one object per process. Children are traced too; the target is
-   usually the object with the most leak sites.
-   ```
-   {"pid", "direct", "indirect", "growth": "PASS|FAIL|too short|attached", "growth_bytes_per_s",
-    "growth_window_bytes", "window_from_s",
-    "leaks": [{"bytes", "direct", "indirect", "blocks", "kind": "cpu|gpu|host|mmap", "site"}],
-    "held": [{"site", "held_by"}],            // who holds a PEAK site now: "make_table x.c:7 << global g_cache"
-    "gpu_timeline": [{"site", "points": [[t_ms, bytes]]}]}   // with --gpu-timeline
-   ```
-4. **Fix the top direct leak first.** `site` is `function file:line`, the user's own frame
-   included. Indirect leaks (only reachable from another leak) usually disappear with their owner;
-   fix direct ones and re-run before touching indirect ones.
-5. **Prove it.** Re-run the same command and show the site's `direct` went to 0 (or GROWTH flipped
-   to PASS) next to the before number. A fix without the second run is not a fix.
+1. **Reproduce small.** The shortest run that shows the symptom; for growth, loop the suspect
+   operation so setup is under half the run.
+2. **Run capped.** `scripts/ht.sh run .work/ht [--gpu] [--py] -- CMD ARGS`. It runs under a systemd
+   memory cap (`HT_MEM`, default half of free memory): a blowup kills the job, not the session.
+   Without the script: `systemd-run --user --scope -p MemoryMax=8G heaptide run --out .work/ht -- CMD`.
+3. **Read** the summary (or `report.json`). Check the warnings first: `WARN stack table full`
+   and `--py WARN untracked` mean the numbers are a lower bound.
+4. **Fix the top direct leak** (`site` = `function file:line`, the user's frame included).
+   Indirect leaks usually go with their owner: re-run before touching them.
+5. **Prove it.** Same command again, then `scripts/ht.sh prove .work/ht .work/ht-fixed`: each
+   site's direct bytes before -> after, plus `heaptide diff`. No second run, no fix.
 
-Exit codes: `report` returns 0 clean, 1 leak or growth (per `--fail-on any|leaks|growth|none`),
-2 tool error. In CI use `--fail-on leaks` or `--fail-on growth` to gate on what you care about.
+## Rules that cost a turn when skipped
 
-## Deciding what is real
-
-| report says | it means | do |
-|---|---|---|
-| `direct` at a site in your code | unfreed and nothing points to it | fix: free it, or give it an owner |
-| `indirect` only | held only by another leaked block | fix that block's owner |
-| `kind: gpu` or `host` unfreed | device or pinned buffer never freed | always real: GPU blocks are never treated as reachable |
-| `kind: mmap` | an anonymous mapping never unmapped, or a part of a `PROT_NONE` reservation that `mprotect` committed (site = the `mprotect` call) | real unless it is an arena the runtime keeps by design |
-| a few hundred B in `hsa_amd_signal_create`, `amd::roc::Device`, `_dl_*` | HIP/Mojo runtime residue | suppress, do not "fix" |
-| `suppressed N B in K blocks by the default runtime list` under LEAKS | the ROCm runtime's one-time allocations (`AqlQueue`, `rocprofiler_register` setenv), already dropped from the totals by `report/default.supp` | nothing; `--no-default-supp` lists them. Report a site that looks like runtime residue but is not in the list by adding a chain line to a `--supp` file |
-| GROWTH FAIL, few direct leaks | memory held, not lost: caches, queues, pools that keep growing | read `held` (`held by:` under PEAK): it names the holder chain, from the site to a global, a thread's stack, or memory from before attach. Holders are recorded for memory live at the report: for a service, `heaptide snapshot` while it grows |
-| GROWTH `too short` | fewer than 5 samples | run longer or lower `--every` |
-| GROWTH `n/a` (JSON `attached`) | attached: live bytes count from 0 at attach, so their ramp is not growth | `heaptide snapshot` twice while it runs, then `heaptide diff A B` |
-
-The ROCm runtime's own one-time blocks are already suppressed by default (`report/default.supp`, named in one line under LEAKS). For anything else suppress with `--supp FILE` (one substring of a site per line). Keep the file next to the test that
-uses it and say in a comment why each line is residue. A site that a program's own call can also produce (`setenv`, `strdup`) must not be suppressed by its two-frame site alone.
-
-## GROWTH, read it right
-
-- The window starts after the first 20% of samples. If that fails, it moves later (up to half the
-  run) to skip a long setup; `window_from_s` tells you where it landed. The rise is the slope
-  projected over the full span, so a short late window cannot hide a steady leak.
-- It fails on a rise over 64 KiB **and** over 5% of mean live memory. On a big process (GBs)
-  that is lenient: always add `--growth-limit MIB` (e.g. 16) and report `growth_window_bytes`.
-- A run that is mostly loading fails because loading looks like growth. Lengthen the steady
-  part; do not raise the limit to make it pass.
-
-## Gate a change in CI
-
-```
-heaptide run --out .work/base -- <cmd>    # on the base build
-heaptide run --out .work/new  -- <cmd>    # on the change
-heaptide diff .work/base .work/new [--fail-on new|grown|none] [--json]
-```
-NEW (a leak site only the change has: exit 1 by default), GROWN (direct or peak up by more than
-64 KiB and 10%: exit 1 with `--fail-on grown`), GONE, SHRUNK. Sites are matched without line
-numbers, so moved code is not a change. Only the sites a report shows are compared (every leak,
-the top N peaks): add `--top 50` for more. It needs llvm-symbolizer: unnamed frames warn and only
-match between identical binaries.
-
-## Text report for humans
-
-`heaptide report DIR --top 10` prints the same data plus PEAK (who held memory at the peak),
-HOTSPOTS (most allocations) and TEMPORARIES (alloc then immediate free, a cheap win). Use it
-when the question is "where does memory go", not "what leaked".
-
-## Pitfalls
-
-- Run GPU jobs the way the project schedules its GPU (a queue, a lock); heaptide does not.
-- A forked child keeps the parent's tables until exec; trust exec'd children, not fork-only ones.
-- No `llvm-symbolizer` on the machine: sites show `[module+0xoffset]` only and the report says so. Install
-  LLVM or set `HEAPTIDE_SYMBOLIZER`.
-- ASan builds work only with a shared ASan runtime (gcc's default, clang `-shared-libsan`); clang's
-  default static ASan gets a warning and an empty report.
-- Mojo programs: heaptide switches Mojo's allocator to libc at start so its heap is visible; that
-  is skipped when attached.
-- A snapshot never interrupts a thread asleep in a syscall; such a thread's saved registers are
-  not scanned, so in a snapshot (never at exit) a block held only there can show as leaked.
-- Overhead is about 6x on an allocation-bound loop (`bench/alloc_bench`: 0.02 s bare, 0.13 s) and
-  near zero on code that mostly waits; time-sensitive bugs may still hide under it.
-- Linux x86-64 only.
+- Build C/C++ with `-g`, Mojo with `-g1`; without symbols, sites stop at `[module+0xoffset]`.
+- `--gpu` for every Mojo GPU program (Mojo pools buffers otherwise: one block).
+- Short runs: `--every 20` under a few seconds, or GROWTH says `too short`.
+- SIGKILL and the OOM killer write nothing: add `--snapshot-every 60` to long jobs.
+- A process that leaves through `_exit()` (dash, Ubuntu's `sh`) writes no report: use `bash -c`.
+- Run GPU jobs through the project's GPU scheduler; heaptide does not queue.
+- Never attach to a browser in use; attached runs can under-report, never over-report.
 
 ## Reporting back
 
-State: the command, the before numbers (`direct`, `indirect`, `growth`, `growth_window_bytes`), the
-site you fixed, and the after numbers from the re-run. Name anything you suppressed and why.
+The command, the before numbers (`direct`, `indirect`, `growth`, `growth_window_bytes`), the
+warnings, the site fixed, the after numbers from the re-run, and every suppression with its reason.

@@ -914,6 +914,9 @@ def main() raises:
         var dr_at = cl_at + 8 + (Int(u64(b, cl_at)) if (u64(b, 48) & 32) == 32 and len(b) >= cl_at + 8 else 0)
         if (u64(b, 48) & 128) == 128 and len(b) >= dr_at + 8:
             dropped = u64(b, dr_at)
+        var pre_b: UInt64 = 0  # since v0.1.8 (flag 512, attached): bytes the glibc heap held before attach, a u64 after the drop count
+        if (u64(b, 48) & 640) == 640 and len(b) >= dr_at + 16:
+            pre_b = u64(b, dr_at + 8)
         var exe = maps[0].path if len(maps) > 0 else String("?")
         if flame_data or folded >= 0:
             flames.append(flame(stacks, maps, b, smp_at, nsamp, dir, pid, attached, folded))
@@ -1052,7 +1055,7 @@ def main() raises:
         if as_json:
             if json.byte_length() > 1:
                 json += ","
-            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"suppressed_bytes":', sup_b, ',"suppressed_blocks":', sup_n, ',"ended_without_report":', "true" if ended else "false", ',"dropped_allocations":', dropped, ',"growth":"', verdict,
+            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"suppressed_bytes":', sup_b, ',"suppressed_blocks":', sup_n, ',"ended_without_report":', "true" if ended else "false", ',"before_attach_bytes":', pre_b, ',"dropped_allocations":', dropped, ',"growth":"', verdict,
                            '","growth_bytes_per_s":', Int(slope), ',"growth_window_bytes":', Int(max(grow, 0.0)),
                            ',"window_from_s":', steady if steady.byte_length() > 0 else String("0"), ',"leaks":[')
             var first = True
@@ -1101,6 +1104,11 @@ def main() raises:
         if ended:
             print("ENDED WITHOUT A REPORT (SIGKILL, the OOM killer or _exit): written afterwards from its tables; no leak scan, PEAK and HOTSPOTS hold what it had")
         print("LEAKS  direct", human(leak_d), " indirect", human(leak_i))
+        if attached:
+            if pre_b > 0:
+                print("  before attach:", human(pre_b), "in use in the glibc heap, not tracked: sites under-report by up to this")
+            else:
+                print("  before attach: nothing read (glibc older than 2.33, or the program's own allocator): sites may under-report")
         if sup_n > 0:
             print("  suppressed", human(sup_b), "in", sup_n, "blocks by the default runtime list")
         for l in leak_lines:

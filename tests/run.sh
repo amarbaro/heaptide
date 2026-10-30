@@ -449,6 +449,9 @@ expect c_attach program_exit "$rc" 0
 has c_attach "cpu  lose_after c_attach.c:12"
 has c_attach "held by: memory from before attach"
 has c_attach "GROWTH  n/a (attached"
+has c_attach "before attach:"
+pb=$(./build/heaptide_report "$w/c_attach" --json 2>/dev/null | jq '.[0].before_attach_bytes' || true)
+(( ${pb:-0} >= 520 )) && ok "c_attach before_attach_bytes=$pb >= 520 (holder + table)" || bad c_attach "before_attach_bytes '${pb:-none}', want >= 520"
 expect c_attach json_growth "$(./build/heaptide_report "$w/c_attach" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["growth"])' || true)" attached
 sed -n '/^LEAKS/,/^GROWTH/p' "$w/c_attach.txt" | grep -q "c_attach.c:19" && bad c_attach "table entries reported as leaks ($w/c_attach.txt)" || ok "c_attach no false leak from before attach"
 sleep 30 & sp=$!; rc=0; ./heaptide attach $sp --out "$w/c_attach_denied" 2>/dev/null || rc=$?; kill $sp 2>/dev/null || true

@@ -65,6 +65,7 @@ typedef struct {
   _Atomic uint32_t nstacks;  // new stacks get ids 1..nstacks
   _Atomic int nslot;  // thread slots in use
   _Atomic uint64_t ndropped, ips_used, nsamples;  // ndropped: counted under id 0, row table or frame arena full
+  uint64_t pre_b;  // attached: bytes the glibc heap held before attach (mallinfo2), which no site can show
   char out[4096], cl[4096], maps[1 << 20];
 } shm_hdr;
 static shm_hdr hdr0, *H = &hdr0;  // hdr0 until the file is mapped (or when it cannot be)
@@ -875,6 +876,9 @@ static void attach(void) {
   // PartitionAlloc, a jemalloc or tcmalloc build export malloc): RTLD_NEXT from a library loaded
   // RTLD_LOCAL finds libc's, and a block allocated before attach then reached libc's free (abort).
   scope = RTLD_DEFAULT; r_malloc = 0; resolve();
+  typedef struct { size_t arena, ordblks, smblks, hblks, hblkhd, usmblks, fsmblks, uordblks, fordblks, keepcost; } mi_t;
+  mi_t (*mi)(void) = r_dlsym(RTLD_DEFAULT, "mallinfo2"), m;
+  if (mi) m = mi(), H->pre_b = m.uordblks + m.hblkhd;  // glibc 2.33+; a program on its own allocator reads ~0
   char *maps = vm(1 << 20);  // only when attached: a static buffer cost every program 2 MB resident
   if (!maps) return;
   slurp("/proc/self/maps", maps, 1 << 20);
@@ -1155,9 +1159,9 @@ static void report(int final) {
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
     uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms,
-                       7 | (tl ? 8 : 0) | (attached ? 16 : 0) | 32 | (is_root ? 64 : 0) | 128 | (pm_pid ? 256 : 0) /* leaked block counts, retention,
+                       7 | (tl ? 8 : 0) | (attached ? 16 : 0) | 32 | (is_root ? 64 : 0) | 128 | (pm_pid ? 256 : 0) | (attached ? 512 : 0) /* leaked block counts, retention,
                        timeline, then maps text; attached; the command line after the maps; root; the drop count last; ended
-                       without a report (written afterwards from the /dev/shm tables: no leak scan) */, 0};
+                       without a report (written afterwards from the /dev/shm tables: no leak scan); bytes in use before attach */, 0};
     wr(fd, hdr, sizeof hdr);
     wr(fd, ips_arena, ips_used * 8);
     wr(fd, rows + 1, n * sizeof(row_t));
@@ -1179,6 +1183,7 @@ static void report(int final) {
     wr(fd, cl, 8 + cl[0]);
     uint64_t dropped = ndropped;
     wr(fd, &dropped, 8);
+    if (attached) wr(fd, &H->pre_b, 8);
     pwrite(fd, &hdr[7], 8, 56);
     close(fd);
     rename(tmp, path);
@@ -1592,6 +1597,7 @@ __attribute__((constructor)) static void init(void) {
   if (shm) {  // what a report written after this process is gone needs
     H->magic = 0x4544495450414548ULL; H->pid = getpid(); H->every_ms = every_ms; H->maxstacks = maxstacks; H->ips_cap = ips_cap;
     H->flags = is_root | attached << 1;
+    H->pre_b = hdr0.pre_b;  // attach() ran before the file was mapped
     snprintf(H->out, sizeof H->out, "%s", outdir);
     ssize_t k = slurp("/proc/self/cmdline", H->cl, sizeof H->cl);
     H->cl_n = k > 0 ? (uint64_t)k : 0;

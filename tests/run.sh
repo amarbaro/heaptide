@@ -192,6 +192,17 @@ grep -q "leak 100000 B cpu lose c_leak.c" "$w/sk_a.txt" && ok "ht.sh run names t
 grep -q "^100005 -> 0 B  lose c_leak.c" "$w/sk_prove.txt" && ok "ht.sh prove 100005 -> 0" || bad ht_prove "no before/after line ($w/sk_prove.txt)"
 mkdir -p "$w/sk_mine" && touch "$w/sk_mine/notes"; "$ht" run "$w/sk_mine" -- true > /dev/null 2>&1 || true
 [[ -e $w/sk_mine/notes ]] && ok "ht.sh run keeps a foreign DIR" || bad ht_guard "deleted $w/sk_mine"
+# a process that ends without its report (SIGKILL, _exit) still gets one, from its /dev/shm tables
+cc -O0 -g -o build/c_kill tests/c_kill.c
+rm -rf "$w/c_kill"; ./heaptide run --out "$w/c_kill" -- build/c_kill > "$w/c_kill.out" 2> "$w/c_kill.err" & p=$!
+waitfor 20 grep -q ready "$w/c_kill.out" || true; pkill -9 -x c_kill || true; wait $p || true
+./build/heaptide_report "$w/c_kill" --top 3 > "$w/c_kill.txt" 2>&1 || true
+has c_kill "ENDED WITHOUT A REPORT"
+grep -qE "^   67108864 +cpu +big_alloc c_kill.c" "$w/c_kill.txt" && ok "c_kill names big_alloc with 64 MiB" || bad c_kill "no 64 MiB big_alloc site ($w/c_kill.txt)"
+run c_exit -- build/c_kill exit
+has c_exit "ENDED WITHOUT A REPORT"
+left=$(find /dev/shm -maxdepth 1 -name "heaptide.$(id -u).*" -newer "$w/c_kill.out" | wc -l)
+expect c_kill shm_left "$left" 0
 # allocator, mapping and report corner cases (an external review's reproducers)
 cc -O0 -g -pthread -o build/c_edge tests/c_edge.c
 for m in zero zerobig errno dlsym count partial fixed peak; do rc=0; (ulimit -c 0; exec ./heaptide run --out "$w/edge_$m" -- build/c_edge $m > "$w/edge_$m.out" 2> "$w/edge_$m.err") || rc=$?; expect edge_$m exit "$rc" 0; done

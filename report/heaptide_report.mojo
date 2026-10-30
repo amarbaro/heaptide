@@ -867,6 +867,7 @@ def main() raises:
         var has_held = (u64(b, 48) & 4) == 4  # since v0.1.4: per site, its first holder
         var has_maps = (u64(b, 48) & 2) == 2  # since v0.1.3 the maps text ends the .bin; older: a .maps file
         var attached = (u64(b, 48) & 16) == 16  # since v0.1.5: live bytes start at 0 at attach, so no growth verdict
+        var ended = (u64(b, 48) & 256) == 256  # since v0.1.8: killed (SIGKILL, OOM killer) or _exit: written afterwards, no leak scan
         var nmaps = Int(u64(b, 56)) if has_maps and u64(b, 56) < 1 << 31 else 0
         var ips_at = 64
         var rows_at = ips_at + nips * 8
@@ -1051,7 +1052,7 @@ def main() raises:
         if as_json:
             if json.byte_length() > 1:
                 json += ","
-            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"suppressed_bytes":', sup_b, ',"suppressed_blocks":', sup_n, ',"dropped_allocations":', dropped, ',"growth":"', verdict,
+            json += String('{"pid":', pid, ',"exe":', jstr(exe), ',"cmdline":', jstr(cmdline), ',"root":', "true" if is_root else "false", ',"direct":', leak_d, ',"indirect":', leak_i, ',"suppressed_bytes":', sup_b, ',"suppressed_blocks":', sup_n, ',"ended_without_report":', "true" if ended else "false", ',"dropped_allocations":', dropped, ',"growth":"', verdict,
                            '","growth_bytes_per_s":', Int(slope), ',"growth_window_bytes":', Int(max(grow, 0.0)),
                            ',"window_from_s":', steady if steady.byte_length() > 0 else String("0"), ',"leaks":[')
             var first = True
@@ -1097,6 +1098,8 @@ def main() raises:
             print("   cmd", cmdline)
         if dropped > 0:
             print("WARN stack table full:", dropped, "allocations on stacks with no row are in no section below")
+        if ended:
+            print("ENDED WITHOUT A REPORT (SIGKILL, the OOM killer or _exit): written afterwards from its tables; no leak scan, PEAK and HOTSPOTS hold what it had")
         print("LEAKS  direct", human(leak_d), " indirect", human(leak_i))
         if sup_n > 0:
             print("  suppressed", human(sup_b), "in", sup_n, "blocks by the default runtime list")

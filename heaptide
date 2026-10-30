@@ -10,8 +10,19 @@
 # heaptide diff BASE_DIR NEW_DIR [--fail-on new|grown|none] [--json] [--top N]   (exit 1: a new leak site)
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# recover DIR: a traced process killed by SIGKILL or the OOM killer (or gone through _exit) left its tables
+# in /dev/shm; write its report into DIR now. Called after a run and by report, for when the kill took the
+# wrapper too (systemd stops a whole unit on OOM)
+recover() {
+  local f out; out=$(readlink -f "$1")
+  for f in /dev/shm/heaptide."$(id -u)".*; do
+    [[ -f $f ]] && ! kill -0 "${f##*.}" 2>/dev/null && head -c 8192 "$f" | grep -qaF -- "$out" || continue
+    HEAPTIDE_POSTMORTEM=$f LD_PRELOAD="$here/build/libheaptide.so" /usr/bin/true || echo "heaptide: FAIL post-mortem report from $f" >&2
+    rm -f "$f"
+  done
+}
 case "${1:-}" in
-  report) shift; HEAPTIDE_DEFAULT_SUPP=${HEAPTIDE_DEFAULT_SUPP:-$here/report/default.supp} exec "$here/build/heaptide_report" "$@" ;;
+  report) shift; [[ -d ${1:-} ]] && recover "$1"; HEAPTIDE_DEFAULT_SUPP=${HEAPTIDE_DEFAULT_SUPP:-$here/report/default.supp} exec "$here/build/heaptide_report" "$@" ;;
   snapshot) [[ -d ${2:-} && ( -z ${3:-} || ( $3 == --label && ${4:-} =~ ^[A-Za-z0-9._-]+$ ) ) ]] ||
               { echo "FAIL heaptide: snapshot DIR [--label NAME]   (DIR: the run's --out; NAME: letters, digits, . _ -)" >&2; exit 2; }
             # every traced process answers the new mtime; this returns once the root's report (any, if the
@@ -99,5 +110,6 @@ exe=$(command -v "$1" || true)
 # and its hooks hand every call on to ASan's, so the order check is turned off (both then work)
 [[ ${ASAN_OPTIONS:-} == *verify_asan_link_order* ]] || export ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}verify_asan_link_order=0"
 rc=0; LD_PRELOAD="$here/build/libheaptide.so${LD_PRELOAD:+:$LD_PRELOAD}" "$@" || rc=$?
+recover "$HEAPTIDE_OUT"
 echo "heaptide: report with: heaptide report $HEAPTIDE_OUT" >&2
 exit $rc

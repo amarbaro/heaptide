@@ -57,17 +57,31 @@ typedef struct { atomic_flag lk; ent_t *t; size_t cap, n, limit /* bytes, 0: non
 static tab_t live[SHARDS], stacks[SHARDS];
 static row_t *rows;
 static uint64_t *ips_arena, (*samples)[3];
-static _Atomic uint32_t nstacks;
-static _Atomic uint64_t ndropped;  // new stacks counted under id 0: row table or frame arena full
-static _Atomic uint64_t ips_used, nsamples, peak_mark;
+// The site tables live in one file in /dev/shm (tmpfs: no disk), so a process killed by SIGKILL or
+// the OOM killer leaves them behind; the heaptide wrapper turns that file into a report. Its header
+// carries the counters (the macros below) and what a report needs once the process is gone.
+typedef struct {
+  uint64_t magic, pid, every_ms, maxstacks, ips_cap, flags, maps_n, cl_n;
+  _Atomic uint32_t nstacks;  // new stacks get ids 1..nstacks
+  _Atomic int nslot;  // thread slots in use
+  _Atomic uint64_t ndropped, ips_used, nsamples;  // ndropped: counted under id 0, row table or frame arena full
+  char out[4096], cl[4096], maps[1 << 20];
+} shm_hdr;
+static shm_hdr hdr0, *H = &hdr0;  // hdr0 until the file is mapped (or when it cannot be)
+#define nstacks (H->nstacks)
+#define ndropped (H->ndropped)
+#define ips_used (H->ips_used)
+#define nsamples (H->nsamples)
+#define nslot (H->nslot)
+static _Atomic uint64_t peak_mark;
 static uint32_t maxstacks = MAXSTACKS;  // smaller under an address-space limit (ulimit -v)
 static uint64_t ips_cap = (uint64_t)1 << 30;  // frames
 // Live bytes per kind, one cache line per thread (a shared counter cost most of the hook time with
 // 8 threads); readers sum the lines. Signed: a thread may free what another allocated.
 enum { SLOTS = 1024 };
 typedef struct { uint32_t id, ops; int64_t d[5]; } pend_t;  // allocs, bytes, temps, live_n, live_b
-static struct { _Alignas(64) _Atomic int64_t k[8]; pend_t pend[16]; } lslot[SLOTS];
-static _Atomic int nslot;
+typedef struct { _Alignas(64) _Atomic int64_t k[8]; pend_t pend[16]; } slot_t;
+static slot_t lslot0[SLOTS], *lslot = lslot0;  // in the /dev/shm file once mapped
 static TLS int my_slot = -1;
 static TLS unsigned tick;
 // --gpu-timeline (1 sites, 2 streams, 4 frag): GPU/HOST rows skip the batch so the sampler reads
@@ -563,6 +577,41 @@ HOOK void *dlsym(void *h, const char *name) {
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000ULL + t.tv_nsec; }
 static void report(int final);
+static int shm_fd = -1;
+static char *shm, shm_path[64];
+static size_t shm_n;
+static pid_t pm_pid;  // the dead process a post-mortem report is written for
+static ssize_t slurp(const char *path, char *buf, size_t n);
+// One file holds the header, the thread slots, rows, frames and samples, each page aligned
+static size_t shm_at(int part) {
+  size_t o[5] = {sizeof(shm_hdr), (size_t)SLOTS * sizeof(slot_t), (size_t)maxstacks * sizeof(row_t), ips_cap * 8, (size_t)MAXSAMPLES * 24}, at = 0;
+  for (int i = 0; i < part; i++) at += (o[i] + 4095) & ~(size_t)4095;
+  return at;
+}
+static int shm_map(int fd) {  // fd's tables become this process's
+  char *m = (char *)syscall(SYS_mmap, 0, shm_at(5), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, fd, 0);
+  if (m == MAP_FAILED) return close(fd), 0;
+  shm = m; shm_n = shm_at(5); shm_fd = fd; H = (shm_hdr *)m;
+  lslot = (slot_t *)(m + shm_at(1)); rows = (row_t *)(m + shm_at(2)); ips_arena = (uint64_t *)(m + shm_at(3)); samples = (void *)(m + shm_at(4));
+  return 1;
+}
+static int shm_open_new(void) {  // this process's file, empty and sparse
+  snprintf(shm_path, sizeof shm_path, "/dev/shm/heaptide.%d.%d", (int)getuid(), (int)getpid());
+  int fd = open(shm_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) return -1;
+  if (ftruncate(fd, shm_at(5))) return close(fd), unlink(shm_path), -1;
+  return fd;
+}
+static int dl_count(struct dl_phdr_info *i, size_t n, void *d) { (void)n; *(uint64_t *)d = i->dlpi_adds + (i->dlpi_subs << 32); return 1; }
+static void shm_maps(void) {  // the maps text a report needs once the process is gone, when a library came or went
+  static uint64_t last = ~0ULL;
+  uint64_t c = 0;
+  dl_iterate_phdr(dl_count, &c);
+  if (!shm || c == last) return;
+  last = c; H->maps_n = 0;
+  ssize_t k = slurp("/proc/self/maps", H->maps, sizeof H->maps);
+  H->maps_n = k > 0 ? (uint64_t)k : 0;
+}
 static void py_dump(pid_t pid);
 static void py_snap(void);  // --py: holder chains for this snapshot
 static char outdir[4096] = ".";
@@ -632,6 +681,7 @@ static void *sampler(void *a) {
   int64_t seen = MTIME(0);  // a request from before this process started is not its own
   for (uint64_t next = now_ns() + snap_ns; !stop;) {
     sample();
+    shm_maps();
     if (got_sig) { int sig = got_sig; report(1); signal(sig, SIG_DFL); raise(sig); }
     if (!access(dtrig, F_OK)) { detach(); unlink(dtrig); return 0; }  // gone: heaptide detach returns
     if (child > 0 && syscall(SYS_wait4, child, 0, WNOHANG | __WCLONE, 0) == child) child = 0;
@@ -999,11 +1049,12 @@ static void report(int final) {
   // A snapshot scans a copy-on-write fork, so the program pauses only for the fork, not the scan.
   // Raw clone: no atfork handlers or malloc locks (a parked thread may hold one); no exit signal,
   // so the program's own wait() never sees it. On failure (no memory) it scans in place.
-  pid_t pid = getpid();
+  pid_t pid = pm_pid ? pm_pid : getpid();
   if (!final && (child = syscall(SYS_clone, 0, 0, 0, 0, 0)) > 0) {
     released = 1; unvm(segs, 4096 * 16);
     guard = g; atomic_flag_clear(&reporting); return;
   }
+  if (!final && !child && shm) syscall(SYS_mmap, shm, shm_n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_NORESERVE, shm_fd, 0);  // its own copy
   if (final || !child) flush_all();  // the snapshot fork flushes its copy; in place, the batches stay with their owners
   peak_check(1);  // growth after the last 1% step; after the flush, so batched rows count
   // every block: live-table entries, plus mmap blocks in a side array (never put in the table)
@@ -1104,8 +1155,9 @@ static void report(int final) {
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
     uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms,
-                       7 | (tl ? 8 : 0) | (attached ? 16 : 0) | 32 | (is_root ? 64 : 0) | 128 /* leaked block counts, retention, timeline, then
-                       maps text; attached; the command line after the maps; root; the drop count last */, 0};
+                       7 | (tl ? 8 : 0) | (attached ? 16 : 0) | 32 | (is_root ? 64 : 0) | 128 | (pm_pid ? 256 : 0) /* leaked block counts, retention,
+                       timeline, then maps text; attached; the command line after the maps; root; the drop count last; ended
+                       without a report (written afterwards from the /dev/shm tables: no leak scan) */, 0};
     wr(fd, hdr, sizeof hdr);
     wr(fd, ips_arena, ips_used * 8);
     wr(fd, rows + 1, n * sizeof(row_t));
@@ -1115,19 +1167,22 @@ static void report(int final) {
     wr(fd, blocks + 1, n * 8);
     wr(fd, held + 1, n * 8);
     if (tl) { uint64_t c = ntl; wr(fd, &c, 8); wr(fd, tl, c * 16); }
-    int in = open("/proc/self/maps", O_RDONLY);
+    int in = pm_pid ? -1 : open("/proc/self/maps", O_RDONLY);
+    if (pm_pid) wr(fd, H->maps, H->maps_n), hdr[7] = H->maps_n;
     char buf[1 << 16];
     for (ssize_t k; in >= 0 && ((k = read(in, buf, sizeof buf)) > 0 || (k < 0 && errno == EINTR));)
       if (k > 0) wr(fd, buf, k), hdr[7] += k;
     if (in >= 0) close(in);
     uint64_t cl[513] = {0};  // {length, /proc/self/cmdline up to 4 KiB}
-    if ((in = open("/proc/self/cmdline", O_RDONLY)) >= 0) { ssize_t k = read(in, cl + 1, 4096); cl[0] = k > 0 ? k : 0; close(in); }
+    if (pm_pid) cl[0] = H->cl_n < 4096 ? H->cl_n : 4096, memcpy(cl + 1, H->cl, cl[0]);
+    else if ((in = open("/proc/self/cmdline", O_RDONLY)) >= 0) { ssize_t k = read(in, cl + 1, 4096); cl[0] = k > 0 ? k : 0; close(in); }
     wr(fd, cl, 8 + cl[0]);
     uint64_t dropped = ndropped;
     wr(fd, &dropped, 8);
     pwrite(fd, &hdr[7], 8, 56);
     close(fd);
     rename(tmp, path);
+    if (final && shm) unlink(shm_path);  // reported: nothing to recover
   }
   dprintf(2, "heaptide: %spid=%d direct=%lu indirect=%lu live_cpu=%lu live_gpu=%lu live_host=%lu live_mmap=%lu temps=%lu stacks=%u threads=%d/%d -> %s/heaptide.%d.bin\n",
           final ? "" : "snapshot ", pid, sum[0], sum[1], live_total(CPU), live_total(GPU), live_total(HOST), live_total(MMAP), sum[2], n,
@@ -1158,6 +1213,7 @@ static void detach(void) {
   done = 1, ready = 0, stop = 1;
   atomic_flag_clear(&reporting);
   if (child > 0) syscall(SYS_wait4, child, 0, __WCLONE, 0), child = 0;
+  if (shm) unlink(shm_path);  // untracked from here: no report to recover
   Dl_info me; dladdr((void *)detach, &me);
   undo = 1; dl_iterate_phdr(patch_cb, me.dli_fbase);
   struct sigaction sa;
@@ -1447,6 +1503,14 @@ static void forked(void) {
   if (nochild) done = 1, ready = 0;  // --no-children: not traced from here, no report
   if (done) return;  // after the final report or a detach: nothing to restart
   flush_all();
+  if (shm) {  // its own file, with the parent's tables so far: the parent's must not see the child's
+    int fd = shm_open_new();
+    size_t part[4][2] = {{0, sizeof(shm_hdr)}, {shm_at(1), (size_t)SLOTS * sizeof(slot_t)}, {shm_at(2), (nstacks + 1) * sizeof(row_t)}, {shm_at(3), ips_used * 8}};
+    for (int i = 0; fd >= 0 && i < 4; i++) pwrite(fd, shm + part[i][0], part[i][1], part[i][0]);
+    if (fd >= 0 && syscall(SYS_mmap, shm, shm_n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_NORESERVE, fd, 0) != (long)shm) fd = -1;
+    if (fd >= 0) close(shm_fd), shm_fd = fd, H->pid = getpid();
+    else done = 1, ready = 0;  // no own file: untraced rather than writing into the parent's
+  }
   for (int i = 0; i < SHARDS; i++)
     for (size_t j = 0; j < live[i].cap; j++) live[i].t[j].v |= live[i].t[j].k ? REACH : 0;
   for (size_t i = 0; i < nmm; i++) mm[i].inh = 1;
@@ -1464,6 +1528,21 @@ static int listed(const char *l, const char *n) {  // n is an item of the comma 
     if ((p == l || p[-1] == ',') && (p[k] == ',' || !p[k])) return 1;
   return 0;
 }
+// HEAPTIDE_POSTMORTEM=FILE (the heaptide wrapper, after a traced process ended without a report):
+// FILE's tables become this process's, and the usual writer turns them into heaptide.<pid>.bin.
+// The heap is gone, so no leak scan: sites carry what was live at the end.
+static void postmortem(const char *path) {
+  shm_hdr h;
+  int fd = open(path, O_RDWR | O_CLOEXEC);
+  if (fd < 0 || pread(fd, &h, 64, 0) != 64 || h.magic != 0x4544495450414548ULL) { if (fd >= 0) close(fd); _exit(2); }
+  maxstacks = h.maxstacks; ips_cap = h.ips_cap;
+  if (!shm_map(fd) || !(mm = cold((size_t)sizeof(map_t) << 20)) || !(rs = cold((size_t)sizeof(map_t) << 20)) || !(dn = cold((size_t)sizeof(map_t) << 20))) _exit(2);
+  snprintf(shm_path, sizeof shm_path, "%s", path);
+  pm_pid = H->pid; every_ms = H->every_ms; is_root = H->flags & 1; attached = !!(H->flags & 2);
+  snprintf(outdir, sizeof outdir, "%s", H->out);
+  report(1);
+  _exit(0);
+}
 __attribute__((constructor)) static void init(void) {
   { // one unwind now: libunwind's thread key is created while few exist (an index under 32 needs no
     // glibc key block, so pthread_setspecific never allocates inside a hook); its handle for unw_ready
@@ -1473,6 +1552,8 @@ __attribute__((constructor)) static void init(void) {
       unw_h = 0;  // no thread-local state: always ready
   }
   resolve();
+  const char *pm = getenv("HEAPTIDE_POSTMORTEM");
+  if (pm) postmortem(pm);
   // --no-children, --only NAME,...: any other process keeps the preload untraced (hooks pass through,
   // no memory, no file). The root is the first traced process, or an exec'd root (same pid).
   const char *rt = getenv("HEAPTIDE_ROOT"), *only = getenv("HEAPTIDE_ONLY");
@@ -1490,9 +1571,12 @@ __attribute__((constructor)) static void init(void) {
   for (; !getrlimit(RLIMIT_AS, &as) && as.rlim_cur != RLIM_INFINITY && maxstacks > 4096 &&
          maxstacks * sizeof(row_t) + ips_cap * 8 > as.rlim_cur / 4;) maxstacks /= 2, ips_cap /= 2;
   { const char *m = getenv("HEAPTIDE_MAXSTACKS"); if (m && atoi(m) > 1 && (uint32_t)atoi(m) < maxstacks) maxstacks = atoi(m); }  // tests only
-  rows = cold((size_t)maxstacks * sizeof(row_t));
-  ips_arena = cold(ips_cap * 8);
-  samples = cold((size_t)MAXSAMPLES * 24);
+  int fd = shm_open_new();
+  if (fd < 0 || !shm_map(fd)) {  // no /dev/shm: anonymous tables, no report after a SIGKILL
+    rows = cold((size_t)maxstacks * sizeof(row_t));
+    ips_arena = cold(ips_cap * 8);
+    samples = cold((size_t)MAXSAMPLES * 24);
+  }
   mm = cold((size_t)sizeof(map_t) << 20); rs = cold((size_t)sizeof(map_t) << 20); dn = cold((size_t)sizeof(map_t) << 20);
   if (!rows || !ips_arena || !samples || !mm || !rs || !dn) {
     dprintf(2, "heaptide: FAIL out of address space (ulimit -v?): not recording\n");
@@ -1505,6 +1589,14 @@ __attribute__((constructor)) static void init(void) {
   dl_iterate_phdr(self_cb, me.dli_fbase);
   unw_set_caching_policy(unw_local_addr_space, UNW_CACHE_PER_THREAD);
   if ((e = getenv("HEAPTIDE_OUT"))) snprintf(outdir, sizeof outdir, "%s", e);
+  if (shm) {  // what a report written after this process is gone needs
+    H->magic = 0x4544495450414548ULL; H->pid = getpid(); H->every_ms = every_ms; H->maxstacks = maxstacks; H->ips_cap = ips_cap;
+    H->flags = is_root | attached << 1;
+    snprintf(H->out, sizeof H->out, "%s", outdir);
+    ssize_t k = slurp("/proc/self/cmdline", H->cl, sizeof H->cl);
+    H->cl_n = k > 0 ? (uint64_t)k : 0;
+    shm_maps();
+  }
   if (is_root) {  // OUT/root names it for heaptide snapshot; its children see the variable
     char v[16], path[4200]; snprintf(v, sizeof v, "%d", getpid()); setenv("HEAPTIDE_ROOT", v, 1);
     snprintf(path, sizeof path, "%s/root", outdir);

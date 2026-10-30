@@ -52,7 +52,7 @@ _Static_assert(sizeof(row_t) == 56, "row layout is the file format");
 // Open-addressing table, 16 B entries, key 0 = empty. Value of a live block:
 // size << 26 | INDIRECT | REACH | stack id (24 bits).
 typedef struct { uint64_t k, v; } ent_t;
-typedef struct { atomic_flag lk; ent_t *t; size_t cap, n; char pad[32]; } tab_t;
+typedef struct { atomic_flag lk; ent_t *t; size_t cap, n, limit /* bytes, 0: none */; char pad[24]; } tab_t;
 
 static tab_t live[SHARDS], stacks[SHARDS];
 static row_t *rows;
@@ -159,18 +159,23 @@ static ent_t *slot(tab_t *s, uint64_t k) {
   for (size_t i = mix(k) & (s->cap - 1);; i = (i + 1) & (s->cap - 1))
     if (s->t[i].k == k || !s->t[i].k) return &s->t[i];
 }
-static void put(tab_t *s, uint64_t k, uint64_t v) {
+static int put(tab_t *s, uint64_t k, uint64_t v) {  // 0: not stored (table full at its limit)
   ent_t *t;
-  if ((!s->t || (s->n + 1) * 2 > s->cap) && (t = vm((s->cap ? s->cap * 2 : 1024) * sizeof(ent_t)))) {
+  if ((!s->t || (s->n + 1) * 4 > s->cap * 3) && (!s->limit || !s->t || s->cap * 2 * sizeof(ent_t) <= s->limit) &&
+      (t = vm((s->cap ? s->cap * 2 : 1024) * sizeof(ent_t)))) {
     tab_t o = *s;
     s->cap = o.cap ? o.cap * 2 : 1024; s->t = t; s->n = 0;
     for (size_t i = 0; i < o.cap; i++) if (o.t[i].k) { *slot(s, o.t[i].k) = o.t[i]; s->n++; }
     if (o.t) syscall(SYS_munmap, o.t, o.cap * sizeof(ent_t));
   }
-  if (!s->t || s->n + 1 >= s->cap) return;  // out of address space: the block goes untracked
+  if (!s->t) return 0;
   ent_t *e = slot(s, k);
-  if (!e->k) { e->k = k; s->n++; }
+  if (!e->k) {
+    if ((s->n + 1) * 8 > s->cap * 7) return 0;  // at the limit or out of address space: untracked
+    e->k = k; s->n++;
+  }
   e->v = v;
+  return 1;
 }
 static ent_t *get(tab_t *s, uint64_t k) { if (!s->t) return 0; ent_t *e = slot(s, k); return e->k ? e : 0; }
 static int del(tab_t *s, uint64_t k, uint64_t *v) {
@@ -1237,13 +1242,37 @@ static uint32_t py_site(void) {
   for (int i = 0; i < d; i++) P.decref(c[i]);
   return e[1];
 }
+static uint64_t py_drop_n, py_drop_b;
+// MemAvailable, or this cgroup's memory.max minus its usage when that is smaller (0: unknown)
+static size_t avail_bytes(void) {
+  char b[4096], p[512]; ssize_t k; size_t av = 0;
+  int fd = open("/proc/meminfo", O_RDONLY);
+  if (fd >= 0 && (k = read(fd, b, sizeof b - 1)) > 0) { b[k] = 0; char *m = strstr(b, "MemAvailable:"); if (m) av = strtoull(m + 13, 0, 10) << 10; }
+  if (fd >= 0) close(fd);
+  if ((fd = open("/proc/self/cgroup", O_RDONLY)) >= 0 && (k = read(fd, b, sizeof b - 1)) > 0) {
+    b[k] = 0; char *c = strstr(b, "0::"), *nl;
+    if (c && (nl = strchr(c, '\n'))) {
+      *nl = 0; uint64_t mx = 0, cur = 0;
+      snprintf(p, sizeof p, "/sys/fs/cgroup%s/memory.max", c + 3);
+      int f = open(p, O_RDONLY);
+      if (f >= 0 && (k = read(f, b + 2048, 64)) > 0) { b[2048 + k] = 0; mx = strtoull(b + 2048, 0, 10); }  // "max" reads 0
+      if (f >= 0) close(f);
+      snprintf(p, sizeof p, "/sys/fs/cgroup%s/memory.current", c + 3);
+      if ((f = open(p, O_RDONLY)) >= 0 && (k = read(f, b + 2048, 64)) > 0) { b[2048 + k] = 0; cur = strtoull(b + 2048, 0, 10); }
+      if (f >= 0) close(f);
+      if (mx > cur && (!av || mx - cur < av)) av = mx - cur;
+    }
+  }
+  if (fd >= 0) close(fd);
+  return av;
+}  // blocks the capped live table had no room for
 static void py_track(void *p, size_t n) {
   if (!p || py_in || !ready) return;
   py_in = 1;
   int err = errno;
   uint32_t s = py_site();
-  put(&py_live, (uint64_t)p, (uint64_t)n << SIZE_SHIFT | s);
-  py_rows[s].bytes += n; py_rows[s].blocks++;
+  if (put(&py_live, (uint64_t)p, (uint64_t)n << SIZE_SHIFT | s)) py_rows[s].bytes += n, py_rows[s].blocks++;
+  else py_drop_n++, py_drop_b += n;
   errno = err;
   py_in = 0;
 }
@@ -1287,7 +1316,12 @@ HOOK int heaptide_py_start(const char *self) {
   if (!py_lasti) P.at = r_dlsym(RTLD_DEFAULT, "PyFrame_GetLineNumber");
   if (!get || !set || !P.frame || !P.code || !P.back || !P.getattr || !P.line || !P.utf8 || !P.incref || !P.decref || !P.at || !P.gil || !P.ungil) return 1;
   if (!(py_rows = cold(MAXPY * sizeof(pyrow_t))) || !(py_names = cold(PYNAMES))) return 1;
-  char *e = getenv("HEAPTIDE_PY_DEPTH");
+  // the live table costs ~50 B per live Python block: on a big heap that doubled the process, and a
+  // torch run OOM-killed the desktop. Its cap: HEAPTIDE_PY_MEM MiB, else 1/8 of what the machine
+  // or this cgroup has available at start; past it, new blocks go untracked and the report says so
+  char *e = getenv("HEAPTIDE_PY_MEM");
+  py_live.limit = e && atoll(e) > 0 ? (size_t)atoll(e) << 20 : avail_bytes() / 8;
+  e = getenv("HEAPTIDE_PY_DEPTH");
   py_depth = e && atoi(e) > 0 ? (atoi(e) < 8 ? atoi(e) : 8) : 1;
   snprintf(py_self, sizeof py_self, "%s", self);
   py_rows[0].hide = 1;
@@ -1319,6 +1353,9 @@ static void py_dump(pid_t pid) {
   snprintf(tmp, sizeof tmp, "%s.tmp", path);
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd < 0) return;
+  if (py_drop_n)
+    dprintf(fd, "  WARN untracked: %lu blocks, %lu B (the live table is capped at %lu MiB: HEAPTIDE_PY_MEM)\n",
+            (unsigned long)py_drop_n, (unsigned long)py_drop_b, (unsigned long)(py_live.limit >> 20));
   for (int i = 0; i < nt; i++)
     dprintf(fd, "  %ld B in %ld blocks  %s\n", (long)py_rows[top[i]].bytes, (long)py_rows[top[i]].blocks, py_names + py_rows[top[i]].name);
   close(fd);

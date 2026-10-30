@@ -565,6 +565,12 @@ print(re.sub(r"data\[\d\]", "data[i]", c[0]) if c else "none")' 2>&1)" "bytearra
   ./build/heaptide_report "$w/py_c" > "$w/py_c.txt" 2>&1 || true
   bc=$(awk '/<string>:1$/ {print $1; exit}' "$w/py_c.txt")
   (( ${bc:-0} >= 500000 )) && ok "py_c <string>:1 holds $bc B" || bad py_c "<string>:1 holds '${bc:-none}' B, want >= 500000 ($w/py_c.txt)"
+  # a capped live table (HEAPTIDE_PY_MEM MiB) leaves new blocks untracked and says so, the run still ends 0
+  rm -rf "$w/py_cap"; rc=0; HEAPTIDE_PY_MEM=1 ./heaptide run --py --out "$w/py_cap" -- python3 -c 'keep = [(i, str(i)) for i in range(200000)]' >/dev/null 2>&1 || rc=$?
+  ./build/heaptide_report "$w/py_cap" > "$w/py_cap.txt" 2>&1 || true
+  expect py_cap exit "$rc" 0
+  has py_cap "WARN untracked:"
+  has py_cap "capped at 1 MiB"
   # --py keeps its PYTHON section on SIGTERM and next to a snapshot
   rm -rf "$w/py_snap" "$w/py_term"
   ./heaptide run --py --out "$w/py_snap" -- python3 tests/py_hold.py >"$w/py_snap.out" 2>/dev/null & p=$!

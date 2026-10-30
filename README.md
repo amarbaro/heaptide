@@ -117,6 +117,9 @@ GPU targets need ROCm/HIP. Python mode hooks CPython's own allocators (no `trace
   are CPython's own and deeper frames only split them.
   Under `--py` the report also names, in Python, the object that holds each top site's memory and the
   biggest GPU tensors (`bytearray << Box.data[0] << __main__.keep['a']`).
+  Tracking costs about 37 B per live Python block (30M blocks: 2.48 GB bare, 3.60 GB traced). The table is capped at
+  1/8 of the memory available at start (`HEAPTIDE_PY_MEM` MiB sets it); past the cap, new blocks go untracked and
+  PYTHON starts with `WARN untracked: N blocks, B B`, so a big heap is no longer an OOM risk.
 - `--every MS` sets the GROWTH sampling period (default 100).
 - Child processes are traced too, each with its own report section named by its command. `--no-children`
   traces the command alone; `--only NAME[,NAME]` traces only processes with those names (argv[0] basename).

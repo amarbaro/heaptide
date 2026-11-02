@@ -1,3 +1,5 @@
+- GPU and pinned host blocks a program still holds are no longer LEAKS: a pointer from outside the HIP runtime marks them held, with a holder. ComfyUI Z-Image: 10.88 GiB false leaks to 0.
+- GROWTH: the window may start up to 3/4 into the run, so a model load late in a short run is not growth.
 - Fixed: a snapshot of a busy traced process could be unreadable (`report` and `diff` crashed): the header and the sections read the shared sample and frame counters at different times, shifting every later offset. Seen on ComfyUI.
 - `report` prints the target process first; a server's helper children no longer bury it.
 # Changelog

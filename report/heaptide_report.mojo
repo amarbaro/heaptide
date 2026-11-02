@@ -1031,7 +1031,7 @@ def main() raises:
                                          ", indirect ", stacks[w].indirect, ", ", stacks[w].leaked_n, " blocks) ", kind_name(stacks[w].kind), "  ", site))
 
         # GROWTH: slope of live bytes after the first 20% of samples; when that fails, the window
-        # start moves later (up to half the run) to skip a long setup, and the earliest window whose
+        # start moves later (up to 3/4 of the run) to skip a long setup or a model load, and the earliest window whose
         # slope, projected over the full span, passes wins
         var verdict = String("attached" if attached else "too short")
         var g = SIMD[DType.float64, 4](0)
@@ -1041,7 +1041,7 @@ def main() raises:
             var span = Float64(u64(b, smp_at + (nsamp - 1) * 24) - u64(b, smp_at + settled * 24)) / 1e9
             g = fit(b, smp_at, settled, nsamp, span, limit)
             var j = 9
-            while g[3] > 0 and j <= 20:
+            while g[3] > 0 and j <= 30:
                 var a = nsamp * j // 40
                 var h = fit(b, smp_at, a, nsamp, span, limit)
                 if h[3] == 0:

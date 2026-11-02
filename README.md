@@ -278,7 +278,7 @@ Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/skills/heaptide
   `heaptide snapshot DIR --label NAME` around a job, compare with `heaptide diff`, and stop with SIGTERM.
   A shell script's `&` starts its job with SIGINT ignored, so `kill -INT` does nothing and the
   fallback SIGKILL leaves a report with no leak scan. `--gpu` turns off torch's cache, so timings under
-  it are not the plain run's. Live tensors the scan cannot reach still show as LEAKS.
+  it are not the plain run's.
 - `heaptide attach` under `sudo` hands the `--out` directory to the target's owner, so the process
   can write its report and you can request snapshots.
 - `heaptide attach PID` loads heaptide into a running process through gdb (`dlopen`), then points

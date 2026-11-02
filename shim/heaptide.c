@@ -696,6 +696,14 @@ static void *sampler(void *a) {
 // Reachability (LSan port): roots = writable segments of loaded
 // objects; flood through CPU blocks; unreached = leaked; leaked blocks reached from other
 // leaked blocks = indirect.
+// The runtime's own tables point at every device block, so only a pointer from outside the runtime
+// proves the program still holds one: a torch tensor's storage does, a lost hipMalloc does not.
+static uint64_t rt_code[32][2]; static int nrt, rt_seg;
+static uint8_t seg_rt[4096];
+static int is_rt_name(const char *n) {
+  return strstr(n, "libamdhip") || strstr(n, "libhsa-runtime") || strstr(n, "libamd_comgr") || strstr(n, "librocprofiler");
+}
+static int rt_stack(uint32_t id);
 static int heap(uint64_t v) { int k = rows[v & (REACH - 1)].kind; return k == CPU || k == MMAP; }
 static ent_t **work;
 static size_t nwork;
@@ -753,7 +761,13 @@ static void scan(const char *b, const char *e, uint64_t bit) {
     for (int j = 0; j < k; j++) {
       ent_t *x = (ent_t *)r[j]->v;
       // GPU/host blocks are never roots-reachable: the HIP runtime's own tables point at all of them
-      if (w[j] < x->k + (x->v >> SIZE_SHIFT) && !(x->v & (REACH | INDIRECT)) && heap(x->v) && !binned(w[j], x)) {
+      if (w[j] < x->k + (x->v >> SIZE_SHIFT) && !(x->v & (REACH | INDIRECT)) && !heap(x->v)) {
+        // device memory: held, never read, so never queued
+        if (bit == REACH && !rt_seg && !(cur && rt_stack(cur))) {
+          x->v |= REACH;
+          if (!held[x->v & (REACH - 1)]) held[x->v & (REACH - 1)] = cur ? cur : 1ULL << 63 | (uint64_t)wa[j];
+        }
+      } else if (w[j] < x->k + (x->v >> SIZE_SHIFT) && !(x->v & (REACH | INDIRECT)) && heap(x->v) && !binned(w[j], x)) {
         x->v |= bit; work[nwork++] = x;
         if (bit == REACH && !held[x->v & (REACH - 1)]) held[x->v & (REACH - 1)] = cur ? cur : 1ULL << 63 | (uint64_t)wa[j];
       }
@@ -795,6 +809,13 @@ static void flood(uint64_t bit) {
 static uintptr_t ld_lo, ld_n;  // the dynamic linker's code
 static uint64_t (*segs)[2];  // writable segments, listed before threads park: a parked thread may
 static int nsegs;            // hold the loader lock that dl_iterate_phdr and dladdr take
+static int rt_stack(uint32_t id) {  // allocated by the runtime
+  row_t *r = &rows[id];
+  for (int k = 0; k < r->depth; k++)
+    for (int i = 0; i < nrt; i++)
+      if (ips_arena[r->ips_off + k] - rt_code[i][0] < rt_code[i][1]) return 1;
+  return 0;
+}
 static int root_cb(struct dl_phdr_info *in, size_t sz, void *self) {
   (void)sz;
   if (in->dlpi_addr == (uintptr_t)self) return 0;
@@ -802,9 +823,11 @@ static int root_cb(struct dl_phdr_info *in, size_t sz, void *self) {
     const ElfW(Phdr) *ph = &in->dlpi_phdr[i];
     if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X) && in->dlpi_addr == getauxval(AT_BASE))
       ld_lo = in->dlpi_addr + ph->p_vaddr, ld_n = ph->p_memsz;
+    if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X) && nrt < 32 && is_rt_name(in->dlpi_name))
+      rt_code[nrt][0] = in->dlpi_addr + ph->p_vaddr, rt_code[nrt++][1] = ph->p_memsz;
     if (ph->p_type == PT_LOAD && (ph->p_flags & PF_W)) {
       uint64_t b = in->dlpi_addr + ph->p_vaddr;
-      if (nsegs < 4096) segs[nsegs][0] = b, segs[nsegs++][1] = b + ph->p_memsz;
+      if (nsegs < 4096) seg_rt[nsegs] = is_rt_name(in->dlpi_name), segs[nsegs][0] = b, segs[nsegs++][1] = b + ph->p_memsz;
       if (in->dlpi_addr == ma_base) ma_lo = ma_lo && ma_lo < b ? ma_lo : b, ma_hi = ma_hi > b + ph->p_memsz ? ma_hi : b + ph->p_memsz;
     }
   }
@@ -1041,6 +1064,7 @@ static void report(int final) {
   nsegs = 0; nstarts = 0; nwork = 0; heap_hi = 0;
   segs = vm(4096 * 16);
   Dl_info me, ma;
+  nrt = 0;
   ma_base = dladdr((void *)r_malloc, &ma) ? (uint64_t)ma.dli_fbase : 0; ma_lo = ma_hi = 0;
   dladdr((void *)report, &me);
   dl_iterate_phdr(root_cb, me.dli_fbase);
@@ -1092,7 +1116,6 @@ static void report(int final) {
   for (size_t i = 0; i < na; i++) {
     ent_t *x = all[i];
     was[i] = !!(x->v & REACH);
-    if (!heap(x->v)) continue;
     uint64_t e = x->k + (x->v >> SIZE_SHIFT);
     starts[nstarts++] = (ent_t){x->k, (uint64_t)x}; heap_hi = e > heap_hi ? e : heap_hi;
   }
@@ -1104,7 +1127,7 @@ static void report(int final) {
   for (size_t i = 0; i < nstarts; i += RUN) top[i / RUN] = starts[i].k;
   for (size_t i = 0; i < ntop; i += RUN) top2[i / RUN] = top[i];
   for (int i = 0; i < nsegs; i++)
-    bins = segs[i][0] >= ma_lo && segs[i][0] < ma_hi, scan((char *)segs[i][0], (char *)segs[i][1], REACH), bins = 0, flood(REACH);
+    bins = segs[i][0] >= ma_lo && segs[i][0] < ma_hi, rt_seg = seg_rt[i], scan((char *)segs[i][0], (char *)segs[i][1], REACH), bins = 0, rt_seg = 0, flood(REACH);
   if (npre) scan_ranges(pre, npre, 1ULL << 61);
   // Private writable memfd mappings are anonymous memory with a name: Qt's JavaScript engine keeps its
   // GC heap there (JSGCHeap, JSVMStack), other VMs and JITs do the same. Never tracked as blocks (they

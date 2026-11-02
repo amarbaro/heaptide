@@ -274,6 +274,11 @@ Claude Code: `~/.claude/skills/heaptide` or a project's `.claude/skills/heaptide
   roots. Before v0.1.5 a QML program holding 2,000 strings showed 968,572 B of false leaks in a
   snapshot; now 192 B. A stack frame in JIT code (in a memfd) reads `[jit QtQml]`, named by its
   runtime.
+- Servers such as ComfyUI: start from launch with `run --gpu --py --gpu-timeline all`, take
+  `heaptide snapshot DIR --label NAME` around a job, compare with `heaptide diff`, and stop with SIGTERM.
+  A shell script's `&` starts its job with SIGINT ignored, so `kill -INT` does nothing and the
+  fallback SIGKILL leaves a report with no leak scan. `--gpu` turns off torch's cache, so timings under
+  it are not the plain run's. Live tensors the scan cannot reach still show as LEAKS.
 - `heaptide attach` under `sudo` hands the `--out` directory to the target's owner, so the process
   can write its report and you can request snapshots.
 - `heaptide attach PID` loads heaptide into a running process through gdb (`dlopen`), then points

@@ -1158,16 +1158,19 @@ static void report(int final) {
   snprintf(tmp, sizeof tmp, "%s.tmp", path);
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
-    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, ips_used, nsamples, (uint64_t)every_ms,
+    // read once: in a snapshot fork the parent's threads still advance these shared counters, and a
+    // header that disagrees with the sections shifts every offset after them
+    uint64_t nips_w = ips_used, nsmp_w = nsamples;
+    uint64_t hdr[8] = {0x4544495450414548ULL /* "HEAPTIDE" */, (uint64_t)pid, n, nips_w, nsmp_w, (uint64_t)every_ms,
                        7 | (tl ? 8 : 0) | (attached ? 16 : 0) | 32 | (is_root ? 64 : 0) | 128 | (pm_pid ? 256 : 0) | (attached ? 512 : 0) /* leaked block counts, retention,
                        timeline, then maps text; attached; the command line after the maps; root; the drop count last; ended
                        without a report (written afterwards from the /dev/shm tables: no leak scan); bytes in use before attach */, 0};
     wr(fd, hdr, sizeof hdr);
-    wr(fd, ips_arena, ips_used * 8);
+    wr(fd, ips_arena, nips_w * 8);
     wr(fd, rows + 1, n * sizeof(row_t));
     wr(fd, direct + 1, n * 8);
     wr(fd, indirect + 1, n * 8);
-    wr(fd, samples, nsamples * 24);
+    wr(fd, samples, nsmp_w * 24);
     wr(fd, blocks + 1, n * 8);
     wr(fd, held + 1, n * 8);
     if (tl) { uint64_t c = ntl; wr(fd, &c, 8); wr(fd, tl, c * 16); }

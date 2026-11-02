@@ -843,6 +843,13 @@ def main() raises:
                 if len(h) == 24 and u64(h, 16) >= main_n:
                     main_n = u64(h, 16)
                     main_bin = name
+    var ordered = List[String]()  # the target first: a server's helpers (uv, git) must not bury it
+    if main_bin.byte_length() > 0:
+        ordered.append(main_bin)
+    for x in names_in_dir:
+        if x != main_bin:
+            ordered.append(x)
+    names_in_dir = ordered^
     for name in names_in_dir:
         if not (name.startswith("heaptide.") and name.endswith(".bin")):
             continue

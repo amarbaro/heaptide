@@ -1,3 +1,5 @@
+- Fixed: a snapshot of a busy traced process could be unreadable (`report` and `diff` crashed): the header and the sections read the shared sample and frame counters at different times, shifting every later offset. Seen on ComfyUI.
+- `report` prints the target process first; a server's helper children no longer bury it.
 # Changelog
 
 Full notes in `docs/releases/`. Newest first.

@@ -73,7 +73,12 @@ print(";".join(x["exe"] + ("*" if x["root"] else "") for x in json.load(sys.stdi
 # per-process RSS floor: under THP "always" each arena's first touch was a 2 MiB page (sleep: +7.2 MB)
 sleep 3 & b=$!; HEAPTIDE_OUT="$PWD/$w" LD_PRELOAD="$PWD/build/libheaptide.so" sleep 3 2>/dev/null & h=$!
 waitfor 10 grep -qE 'SigCgt:.*[1-9a-f]' "/proc/$h/status" || true  # the shim's handlers: it is initialised
-d=$(( $(awk '/^VmRSS/ {print $2}' /proc/$h/status) - $(awk '/^VmRSS/ {print $2}' /proc/$b/status) )); kill $b $h; wait $b $h 2>/dev/null || true
+d=$(( $(awk '/^VmRSS/ {print $2}' /proc/$h/status) - $(awk '/^VmRSS/ {print $2}' /proc/$b/status) ))
+# the floor holds under any THP mode only if no big anonymous region of ours can take huge pages
+# (the local "madvise" mode hides it; a CI runner under "always" measured +10 MB from the .bss)
+hp=$(awk '/^[0-9a-f]+-/ {n = $6} /^Size:/ {s = $2} /^VmFlags:/ && n == "" && s >= 4096 && !/ nh/ {c++} END {print c + 0}' "/proc/$h/smaps")
+expect rss_floor huge_eligible "$hp" 0
+kill $b $h; wait $b $h 2>/dev/null || true
 (( d < 2048 )) && ok "rss_floor +$d kB per process" || bad rss_floor "+$d kB over bare sleep, want < 2048"
 run c_setup --every 20 -- build/c_setup
 has c_setup "GROWTH  PASS"

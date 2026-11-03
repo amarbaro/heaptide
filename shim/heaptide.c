@@ -384,8 +384,13 @@ static void *next(const char *name) {
 // Other libraries' constructors can allocate before ours runs: resolve on first use, and serve
 // only the allocations made while resolving (dlsym's own calloc) from the static buffer.
 static int resolving;
+// Our own .bss (6.4 MB of tables) is anonymous memory too: under THP "always" its first writes took
+// 2 MiB pages (CI runner: +10 MB per process). Marked before this function's first write to it.
+extern char __bss_start[] __attribute__((visibility("hidden"))), _end[] __attribute__((visibility("hidden")));
 static void resolve(void) {
   if (r_malloc || resolving) return;
+  uintptr_t b = ((uintptr_t)__bss_start + 4095) & ~(uintptr_t)4095;
+  if ((uintptr_t)_end > b) syscall(SYS_madvise, b, (uintptr_t)_end - b, MADV_NOHUGEPAGE);
   resolving = 1;
   r_calloc = next("calloc"); r_realloc = next("realloc"); r_free = next("free");
   r_posix_memalign = next("posix_memalign"); r_aligned_alloc = next("aligned_alloc");

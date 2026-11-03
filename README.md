@@ -1,6 +1,9 @@
 # heaptide
 
-[![cpu](https://github.com/amarbaro/heaptide/actions/workflows/cpu.yml/badge.svg)](https://github.com/amarbaro/heaptide/actions/workflows/cpu.yml)
+<!-- badges -->
+[![cpu](https://github.com/amarbaro/heaptide/actions/workflows/cpu.yml/badge.svg?branch=main)](https://github.com/amarbaro/heaptide/actions/workflows/cpu.yml) [![release](https://github.com/amarbaro/heaptide/actions/workflows/release.yml/badge.svg)](https://github.com/amarbaro/heaptide/actions/workflows/release.yml) [![latest release](https://img.shields.io/github/v/release/amarbaro/heaptide)](https://github.com/amarbaro/heaptide/releases/latest) [![license](https://img.shields.io/github/license/amarbaro/heaptide)](https://github.com/amarbaro/heaptide/blob/main/LICENSE) [![checks](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/amarbaro/heaptide/badges/checks.json)](https://github.com/amarbaro/heaptide/actions/workflows/cpu.yml)
+<!-- /badges -->
+
 
 heaptide finds leaks in CPU, GPU (HIP and Mojo) and Python programs in one pass, without
 rebuilding them. On an 8-thread malloc benchmark it runs 12x faster than heaptrack with 6.7x less

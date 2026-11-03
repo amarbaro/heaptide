@@ -8,6 +8,7 @@ heaptide diff .work/base .work/new [--fail-on new|grown|none] [--json] [--top N]
 
 - NEW: a leak site only the change has (exit 1 by default). GROWN: direct or peak up by more
   than 64 KiB and 10% (exit 1 with `--fail-on grown`). GONE, SHRUNK: reported, exit 0.
+- A missing value (`--fail-on` with nothing after it) or an unknown option is exit 2, never a silent default.
 - Sites match without line numbers, so moved code is not a change.
 - Only sites a report shows are compared (every leak, the top N peaks): `--top 50` for more.
 - Needs `llvm-symbolizer`: unnamed frames warn and match only between identical binaries.

@@ -3,6 +3,7 @@
 ## Python (`--py`)
 
 - The command must start with `python...`; GIL builds only; about memray's speed.
+- Interpreter options before the script, `-m` or `-c` (`python3 -u -X dev -c ...`) stay the interpreter's.
 - Every Python allocation gets its line, 1 frame deep; `--py-depth N` (max 8) shows call chains,
   for one helper called from many places.
 - Python 3.12+: native and GPU sites end in the Python function (`<- py::load_weights train.py`).

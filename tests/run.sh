@@ -634,7 +634,8 @@ else
   mojo=${MOJO:-$(command -v mojo || ls "$here/.venv/bin/mojo" 2>/dev/null || true)}
   arch=${GPU_ARCH:-$(rocminfo 2>/dev/null | grep -om1 'gfx[0-9a-f]*' || true)}
   queue=(); command -v gpu-wait >/dev/null && queue=(gpu-wait run --priority 90 --vram 1 --timeout 120 --label heaptide-tests --)
-  GPU_BARE_ALLOW=1 timeout 120 /opt/rocm/bin/hipcc -g --offload-arch="$arch" -o build/hip_leak tests/hip_leak.hip 2>/dev/null
+  GPU_BARE_ALLOW=1 timeout 120 /opt/rocm/bin/hipcc -g --offload-arch="$arch" -o build/hip_leak tests/hip_leak.hip 2> "$w/hipcc.err" ||
+    bad hipcc "build failed, ROCM_PATH=${ROCM_PATH:-unset} ($w/hipcc.err)"  # set -e would end the suite with no summary
   GPU_BARE_ALLOW=1 timeout 300 "$mojo" build -g --target-accelerator "$arch" tests/mojo_leak.mojo -o build/mojo_leak 2>/dev/null || true
   "${queue[@]}" bash -c "cd '$here' && ./heaptide run --out $w/hip_leak -- build/hip_leak 2> $w/hip_leak.err; ./heaptide run --gpu --out $w/mojo_leak -- build/mojo_leak 2> $w/mojo_leak.err; ./heaptide run --gpu-timeline all --out $w/hip_leak_tl -- build/hip_leak 2> $w/hip_leak_tl.err" >/dev/null 2>&1 || true
   for t in hip_leak mojo_leak hip_leak_tl; do ./build/heaptide_report "$w/$t" --top 5 > "$w/$t.txt" 2>&1 || true; done

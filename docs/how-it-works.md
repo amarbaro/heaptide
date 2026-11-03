@@ -130,7 +130,7 @@ frame arenas shrink to a quarter of it; if even that cannot be mapped, the shim 
 and says so, and a report that cannot get its memory says so instead of writing a partial file.
 The arenas and the shim's own `.bss` (6.4 MB of tables) are marked `MADV_NOHUGEPAGE`, the `.bss`
 on the first hook call, before anything writes to it: under transparent huge pages "always" each first
-touch would take a 2 MiB page (a traced `sleep` cost +10 MB; now about +1.1 MB). Hash tables and scan
+touch would take a 2 MiB page (a traced `sleep` costs about +1.1 MB; on a GitHub runner the RSS also shows 8 MiB of the shm file that the host maps, clean, for any process). Hash tables and scan
 arrays keep huge pages for the TLB.
 
 A free that hits the block allocated last on the same thread counts as a temporary (heaptrack's

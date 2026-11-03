@@ -2,6 +2,7 @@
 
 Full notes in `docs/releases/`. Newest first.
 
+- [v0.1.10](docs/releases/v0.1.10.md) (2026-11-03): correction, the GitHub runner's +10 MB was the host mapping 8 MiB of the shm file, not heaptide; README badges
 - [v0.1.9](docs/releases/v0.1.9.md) (2026-11-03): THP "always" hosts: the shim no longer adds about 10 MB per traced process
 - [v0.1.8](docs/releases/v0.1.8.md) (2026-11-03): held GPU memory not a leak (ComfyUI 10.88 GiB false leaks to 0), a report after SIGKILL/OOM kill/_exit, --py OOM cap and half the overhead, readable busy snapshots, three CLI fixes (--out reuse, python -u, diff options)
 - [v0.1.7](docs/releases/v0.1.7.md) (2026-10-30): runs on glibc before 2.34, default ROCm suppression list and 200x faster report symbolization, stack table clamp with warning, `py::` frames under Mojo 1.2.0

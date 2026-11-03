@@ -597,6 +597,7 @@ static size_t shm_at(int part) {
 static int shm_map(int fd) {  // fd's tables become this process's
   char *m = (char *)syscall(SYS_mmap, 0, shm_at(5), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, fd, 0);
   if (m == MAP_FAILED) return close(fd), 0;
+  syscall(SYS_madvise, m, shm_at(5), MADV_NOHUGEPAGE);  // tmpfs huge pages: each touched table cost 2 MiB
   shm = m; shm_n = shm_at(5); shm_fd = fd; H = (shm_hdr *)m;
   lslot = (slot_t *)(m + shm_at(1)); rows = (row_t *)(m + shm_at(2)); ips_arena = (uint64_t *)(m + shm_at(3)); samples = (void *)(m + shm_at(4));
   return 1;
@@ -1544,6 +1545,7 @@ static void forked(void) {
     size_t part[4][2] = {{0, sizeof(shm_hdr)}, {shm_at(1), (size_t)SLOTS * sizeof(slot_t)}, {shm_at(2), (nstacks + 1) * sizeof(row_t)}, {shm_at(3), ips_used * 8}};
     for (int i = 0; fd >= 0 && i < 4; i++) pwrite(fd, shm + part[i][0], part[i][1], part[i][0]);
     if (fd >= 0 && syscall(SYS_mmap, shm, shm_n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_NORESERVE, fd, 0) != (long)shm) fd = -1;
+    if (fd >= 0) syscall(SYS_madvise, shm, shm_n, MADV_NOHUGEPAGE);
     if (fd >= 0) close(shm_fd), shm_fd = fd, H->pid = getpid();
     else done = 1, ready = 0;  // no own file: untraced rather than writing into the parent's
   }

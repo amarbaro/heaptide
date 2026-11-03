@@ -78,6 +78,10 @@ d=$(( $(awk '/^VmRSS/ {print $2}' /proc/$h/status) - $(awk '/^VmRSS/ {print $2}'
 # (the local "madvise" mode hides it; a CI runner under "always" measured +10 MB from the .bss)
 hp=$(awk '/^[0-9a-f]+-/ {n = $6} /^Size:/ {s = $2} /^VmFlags:/ && n == "" && s >= 4096 && !/ nh/ {c++} END {print c + 0}' "/proc/$h/smaps")
 expect rss_floor huge_eligible "$hp" 0
+if (( d >= 2048 )); then  # say where the RSS went: largest regions of each, and the THP totals
+  for p in $b $h; do echo "--- smaps $p"; grep -E '^(Rss|AnonHugePages|FilePmdMapped|Anonymous):' /proc/$p/smaps_rollup
+    awk '/^[0-9a-f]+-/ {r = $0} /^Rss:/ && $2 >= 512 {print $2 " kB  " r}' /proc/$p/smaps | sort -rn | head -8; done
+fi
 kill $b $h; wait $b $h 2>/dev/null || true
 (( d < 2048 )) && ok "rss_floor +$d kB per process" || bad rss_floor "+$d kB over bare sleep, want < 2048"
 run c_setup --every 20 -- build/c_setup

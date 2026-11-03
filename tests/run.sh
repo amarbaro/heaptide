@@ -83,6 +83,8 @@ expect rss_floor shm_nohuge "$(awk '/^[0-9a-f]+-/ {r = $0} /^VmFlags:/ && r ~ /d
 if (( d >= 2048 )); then  # say where the RSS went: largest regions of each, and the THP totals
   for p in $b $h; do echo "--- smaps $p"; grep -E '^(Rss|AnonHugePages|FilePmdMapped|Anonymous):' /proc/$p/smaps_rollup
     awk '/^[0-9a-f]+-/ {r = $0} /^Rss:/ && $2 >= 512 {print $2 " kB  " r}' /proc/$p/smaps | sort -rn | head -8; done
+  echo "--- shmem_enabled $(cat /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>&1)"; grep ' /dev/shm ' /proc/mounts
+  grep -A24 '/dev/shm/heaptide' /proc/$h/smaps | grep -vE ' 0 kB$'
 fi
 kill $b $h; wait $b $h 2>/dev/null || true
 (( d < 2048 )) && ok "rss_floor +$d kB per process" || bad rss_floor "+$d kB over bare sleep, want < 2048"

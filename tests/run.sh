@@ -73,27 +73,20 @@ print(";".join(x["exe"] + ("*" if x["root"] else "") for x in json.load(sys.stdi
 # per-process RSS floor: under THP "always" each arena's first touch was a 2 MiB page (sleep: +7.2 MB)
 sleep 3 & b=$!; HEAPTIDE_OUT="$PWD/$w" LD_PRELOAD="$PWD/build/libheaptide.so" sleep 3 2>/dev/null & h=$!
 waitfor 10 grep -qE 'SigCgt:.*[1-9a-f]' "/proc/$h/status" || true  # the shim's handlers: it is initialised
-d=$(( $(awk '/^VmRSS/ {print $2}' /proc/$h/status) - $(awk '/^VmRSS/ {print $2}' /proc/$b/status) ))
+# the shm table file's clean pages are not ours: a GitHub runner maps 8 MiB of any sparse /dev/shm
+# file on its first touch (a process without heaptide shows the same 2048 pages); count what we wrote
+sc=$(awk '/^[0-9a-f]+-/ {s = ($6 ~ /^\/dev\/shm\/heaptide\./)} s && /^Private_Clean:/ {print $2}' "/proc/$h/smaps")
+d=$(( $(awk '/^VmRSS/ {print $2}' /proc/$h/status) - $(awk '/^VmRSS/ {print $2}' /proc/$b/status) - ${sc:-0} ))
 # the floor holds under any THP mode only if no big anonymous region of ours can take huge pages
 # (the local "madvise" mode hides it; a CI runner under "always" measured +10 MB from the .bss)
 hp=$(awk '/^[0-9a-f]+-/ {n = $6} /^Size:/ {s = $2} /^VmFlags:/ && n == "" && s >= 4096 && !/ nh/ {c++} END {print c + 0}' "/proc/$h/smaps")
 expect rss_floor huge_eligible "$hp" 0
-# and the shm tables: a tmpfs mounted huge=within_size gave each touched table a 2 MiB page (CI: 8200 kB)
-expect rss_floor shm_nohuge "$(awk '/^[0-9a-f]+-/ {r = $0} /^VmFlags:/ && r ~ /dev\/shm\/heaptide\./ {print (/ nh/ ? "nh" : "huge")}' "/proc/$h/smaps")" nh
 if (( d >= 2048 )); then  # say where the RSS went: largest regions of each, and the THP totals
   for p in $b $h; do echo "--- smaps $p"; grep -E '^(Rss|AnonHugePages|FilePmdMapped|Anonymous):' /proc/$p/smaps_rollup
     awk '/^[0-9a-f]+-/ {r = $0} /^Rss:/ && $2 >= 512 {print $2 " kB  " r}' /proc/$p/smaps | sort -rn | head -8; done
-  echo "--- shmem_enabled $(cat /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>&1)"; grep ' /dev/shm ' /proc/mounts
-  grep -A24 '/dev/shm/heaptide' /proc/$h/smaps | grep -vE ' 0 kB$'
-  echo "--- kernel $(uname -r)"; grep -H . /sys/kernel/mm/transparent_hugepage/hugepages-*/shmem_enabled 2>/dev/null | grep -v never || true
-  python3 tools/shm_present.py $h
-  # control without heaptide: its own sparse /dev/shm file, one page written; 8 MiB read here too = the runner reads, not the shim
-  python3 -c 'import mmap,os,time; f=os.open("/dev/shm/rss_ctl.%d" % os.getpid(), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600); os.ftruncate(f, 9 << 30); m=mmap.mmap(f, 9 << 30); m[0]=1; time.sleep(2)' & c=$!
-  sleep 1; echo "--- control"; python3 tools/shm_present.py $c | sed 's/heaptide/rss_ctl/'; ps -eo comm= | sort | uniq -c | sort -rn | head -25 | tr '\n' ' '; echo
-  wait $c 2>/dev/null; rm -f /dev/shm/rss_ctl.*
 fi
 kill $b $h; wait $b $h 2>/dev/null || true
-(( d < 2048 )) && ok "rss_floor +$d kB per process" || bad rss_floor "+$d kB over bare sleep, want < 2048"
+(( d < 2048 )) && ok "rss_floor +$d kB per process (shm clean ${sc:-0} kB not counted)" || bad rss_floor "+$d kB over bare sleep, want < 2048"
 run c_setup --every 20 -- build/c_setup
 has c_setup "GROWTH  PASS"
 # --growth-limit: a slow leak under the 5% rule fails once an absolute limit is set; a setup that

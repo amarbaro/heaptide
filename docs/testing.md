@@ -1,17 +1,17 @@
 # Testing
 
-`tests/run.sh` builds everything and runs 232 checks against programs with planted bugs. Where a
+`tests/run.sh` builds everything and runs 239 checks against programs with planted bugs. Where a
 standard tool can answer the same question, its answer is the oracle: heaptrack for leaked
 allocation counts, LeakSanitizer (`clang -fsanitize=leak`) for the direct/indirect split and
 reachability. The script prints `PASS N/N`, or `FAIL k/N <names>` and exits non-zero.
 
-Last full pass (218/218, GPU included): Mojo `1.3.0.dev2026102914` with max `26.8.0.dev2026102914`
+Last full pass (239/239, GPU included, 2026-11-03): Mojo `1.2.0` with max `26.7.0`; earlier 218/218 on Mojo `1.3.0.dev2026102914` with max `26.8.0.dev2026102914`
 (keep both on one nightly date). Mojo 1.2.0 stable builds a report that loses `py::` frames at
 `-O3` unless the source avoids `for ... else` (it does since `0ccce85`).
 
 ```
-tests/run.sh                    # everything, GPU included: PASS 216/216
-tests/run.sh --cpu              # CPU checks only: PASS 211/211 (cpu only: GPU checks not run)
+tests/run.sh                    # everything, GPU included: PASS 239/239
+tests/run.sh --cpu              # CPU checks only: PASS 234/234 (cpu only: GPU checks not run)
 HEAPTIDE_NO_GPU=1 tests/run.sh  # GPU checks skipped and counted as FAIL
 taskset -c 0 tests/run.sh --cpu # one CPU: the signal and snapshot checks poll, never sleep-guess
 tools/ci-local.sh               # .github/workflows/cpu.yml's steps in ubuntu:24.04, on HEAD: run before a push

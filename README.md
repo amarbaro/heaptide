@@ -223,7 +223,7 @@ Internals: [docs/how-it-works.md](docs/how-it-works.md). File format:
 
 ## Every claim above has a check
 
-`tests/run.sh` runs 232 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
+`tests/run.sh` runs 239 checks against planted bugs, with heaptrack and LeakSanitizer as oracles:
 exact leak bytes, file:line, the direct/indirect split, mmap regions, blocks held only by a
 thread's stack or register, interior pointers, fork, reserve-then-commit mappings, growth after a
 long setup, Python lines, HIP and Mojo GPU leaks, Mojo's CPU heap, who holds reachable memory, ASan

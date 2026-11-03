@@ -4,7 +4,7 @@
 import sys,struct
 pid=sys.argv[1]
 for l in open(f'/proc/{pid}/maps'):
-    if '/dev/shm/heaptide' not in l: continue
+    if '/dev/shm/' not in l: continue
     a,b=[int(x,16) for x in l.split()[0].split('-')]
     f=open(f'/proc/{pid}/pagemap','rb'); n=0; runs=[]
     step=1<<20

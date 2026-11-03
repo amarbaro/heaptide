@@ -87,6 +87,10 @@ if (( d >= 2048 )); then  # say where the RSS went: largest regions of each, and
   grep -A24 '/dev/shm/heaptide' /proc/$h/smaps | grep -vE ' 0 kB$'
   echo "--- kernel $(uname -r)"; grep -H . /sys/kernel/mm/transparent_hugepage/hugepages-*/shmem_enabled 2>/dev/null | grep -v never || true
   python3 tools/shm_present.py $h
+  # control without heaptide: its own sparse /dev/shm file, one page written; 8 MiB read here too = the runner reads, not the shim
+  python3 -c 'import mmap,os,time; f=os.open("/dev/shm/rss_ctl.%d" % os.getpid(), os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600); os.ftruncate(f, 9 << 30); m=mmap.mmap(f, 9 << 30); m[0]=1; time.sleep(2)' & c=$!
+  sleep 1; echo "--- control"; python3 tools/shm_present.py $c | sed 's/heaptide/rss_ctl/'; ps -eo comm= | sort | uniq -c | sort -rn | head -25 | tr '\n' ' '; echo
+  wait $c 2>/dev/null; rm -f /dev/shm/rss_ctl.*
 fi
 kill $b $h; wait $b $h 2>/dev/null || true
 (( d < 2048 )) && ok "rss_floor +$d kB per process" || bad rss_floor "+$d kB over bare sleep, want < 2048"

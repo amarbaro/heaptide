@@ -85,7 +85,7 @@ if (( d >= 2048 )); then  # say where the RSS went: largest regions of each, and
     awk '/^[0-9a-f]+-/ {r = $0} /^Rss:/ && $2 >= 512 {print $2 " kB  " r}' /proc/$p/smaps | sort -rn | head -8; done
   echo "--- shmem_enabled $(cat /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>&1)"; grep ' /dev/shm ' /proc/mounts
   grep -A24 '/dev/shm/heaptide' /proc/$h/smaps | grep -vE ' 0 kB$'
-  echo "--- kernel $(uname -r)"; grep -H . /sys/kernel/mm/transparent_hugepage/hugepages-*/shmem_enabled 2>/dev/null | grep -v never
+  echo "--- kernel $(uname -r)"; grep -H . /sys/kernel/mm/transparent_hugepage/hugepages-*/shmem_enabled 2>/dev/null | grep -v never || true
   python3 tools/shm_present.py $h
 fi
 kill $b $h; wait $b $h 2>/dev/null || true

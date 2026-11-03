@@ -108,7 +108,7 @@ GPU targets need ROCm/HIP. Python mode hooks CPython's own allocators (no `trace
   one big block, and the host pool shows up as a leak. It also sets `PYTORCH_NO_CUDA_MEMORY_CACHING=1` and
   `PYTORCH_NO_HIP_MEMORY_CACHING=1`, so each tensor is its own device block. Leak findings are the same either way;
   PEAK and peak memory under `--gpu` are those of the unpooled allocator, not of production.
-- `--py CMD` takes a python command (`python script.py ...`, `python -m pkg.module ...` or `python -c CODE ...`) and charges every Python
+- `--py CMD` takes a python command (`python script.py ...`, `python -m pkg.module ...` or `python -c CODE ...`; interpreter options such as `-u` or `-X dev` before them stay the interpreter's) and charges every Python
   allocation to its line, 1 frame deep (CPython's allocator hooks, as memray does; extensions' own buffers, such as numpy's
   array data, through `PyTraceMalloc_Track`; GIL builds only);
   `--py-depth N` keeps N frames and shows each site as its call chain (on `tests/py_leak.py`:
@@ -121,6 +121,7 @@ GPU targets need ROCm/HIP. Python mode hooks CPython's own allocators (no `trace
   1/8 of the memory available at start (`HEAPTIDE_PY_MEM` MiB sets it); past the cap, new blocks go untracked and
   PYTHON starts with `WARN untracked: N blocks, B B`, so a big heap is no longer an OOM risk.
 - `--every MS` sets the GROWTH sampling period (default 100).
+- `--out DIR` (default `.work/heaptide`) is cleared of an earlier run's heaptide files at start; other files stay.
 - Child processes are traced too, each with its own report section named by its command. `--no-children`
   traces the command alone; `--only NAME[,NAME]` traces only processes with those names (argv[0] basename).
 - Long-running processes: SIGTERM, SIGINT and SIGHUP write the report before the process dies of

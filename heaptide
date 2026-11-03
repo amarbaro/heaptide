@@ -51,7 +51,13 @@ case "${1:-}" in
          (( op )) && setsid xdg-open "$o" > /dev/null 2>&1 < /dev/null &
          exit 0 ;;
   diff) [[ -d ${2:-} && -d ${3:-} ]] || { echo "FAIL heaptide: diff needs two report DIRs" >&2; exit 2; }
-        t=$(mktemp -d "${TMPDIR:-/tmp}/heaptide-diff.XXXXXX"); trap 'rm -rf "$t"' EXIT; top=(); [[ ${4:-} == --top ]] && top=(--top "$5")
+        t=$(mktemp -d "${TMPDIR:-/tmp}/heaptide-diff.XXXXXX"); trap 'rm -rf "$t"' EXIT; top=()
+        for ((i = 4; i <= $#; i++)); do v=$((i + 1)); v=${!v:-}
+          case ${!i} in --json) ;;
+            --fail-on) [[ $v =~ ^(new|grown|none)$ ]] || { echo "FAIL heaptide: --fail-on takes new|grown|none" >&2; exit 2; }; ((i++)) ;;
+            --top) [[ $v =~ ^[0-9]+$ ]] || { echo "FAIL heaptide: --top takes a number" >&2; exit 2; }; top=(--top "$v"); ((i++)) ;;
+            *) echo "FAIL heaptide: unknown diff option ${!i}" >&2; exit 2 ;;
+          esac; done
         for x in 2 3; do "$here/build/heaptide_report" "${!x}" --fail-on none "${top[@]}" --sites "$t/$x" >/dev/null || exit 2; done
         "$here/build/heaptide_report" --diff "$t/2" "$t/3" "${@:4}"; exit $? ;;
   attach) [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "FAIL heaptide: attach PID [--out DIR]" >&2; exit 2; }
@@ -94,13 +100,20 @@ while [[ $# -gt 0 && $1 != -- ]]; do
 done
 [[ ${1:-} == -- ]] && shift
 [[ $# -gt 0 ]] || { echo "FAIL heaptide: no command" >&2; exit 2; }
-mkdir -p "$out"; export HEAPTIDE_OUT=$(readlink -f "$out"); rm -f "$out/root"; unset HEAPTIDE_ROOT
+mkdir -p "$out"; export HEAPTIDE_OUT=$(readlink -f "$out"); unset HEAPTIDE_ROOT
+# a reused DIR: an earlier run's files would join this run's report; other files stay
+rm -f "$out/root" "$out"/heaptide.*.bin "$out"/py.*.txt "$out"/pyheld.*.txt
 if (( py )); then
   export HEAPTIDE_PY=1
   [[ $(basename "$1") == python* ]] || { echo "FAIL heaptide: --py needs a python command" >&2; exit 2; }
   export HEAPTIDE_DEPTH=${HEAPTIDE_DEPTH:-8} HEAPTIDE_PY_DEPTH=$pyd  # the Python lines come from the shim's hooks; native frames past 8 only split sites
   perf=(); "$1" -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2>/dev/null && perf=(-X perf)  # Python frames in native stacks
-  exe=$1; shift; set -- "$exe" "${perf[@]}" "$here/py/run.py" "$@"
+  exe=$1; shift; opt=()  # interpreter options (-u, -X dev, -W x) stay before the runner
+  while [[ $# -gt 0 && $1 == -?* && $1 != -c && $1 != -m && $1 != -- ]]; do
+    if [[ $1 == -[WX] && $# -ge 2 ]]; then opt+=("$1" "$2"); shift 2; else opt+=("$1"); shift; fi
+  done
+  [[ ${1:-} == -- ]] && shift
+  set -- "$exe" "${perf[@]}" "${opt[@]}" "$here/py/run.py" "$@"
 fi
 # static ASan (clang's default) defines malloc in the program itself, ahead of any preload
 exe=$(command -v "$1" || true)

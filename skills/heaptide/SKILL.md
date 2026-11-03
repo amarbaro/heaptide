@@ -19,6 +19,7 @@ the stable interface. `scripts/ht.sh` wraps the loop below and prints one line p
 | a Python job | `--py`, add `--py-depth 4` for shared helpers | [runtimes](references/runtimes.md) § Python |
 | a running process, no restart | `attach` / `snapshot` / `detach` | [runtimes](references/runtimes.md) § attach |
 | "gate this PR on leaks" | two runs + `heaptide diff --fail-on new` | [ci](references/ci.md) |
+| "show me where the memory goes" | `heaptide flame DIR -o OUT.html --open` (interactive flame graph) | [triage](references/triage.md) |
 
 ## The loop
 

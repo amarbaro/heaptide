@@ -29,6 +29,8 @@ for t in c_leak c_reach c_churn c_grow c_flat c_setup c_mmap c_slow c_fork c_int
 
 run c_leak -- build/c_leak
 expect c_leak direct "$(sum c_leak direct)" 100005
+# a reused --out DIR: the earlier run's leaks must not join the next report
+./heaptide run --out "$w/c_leak" -- /usr/bin/true 2>/dev/null; expect c_reuse direct "$(./heaptide report "$w/c_leak" --json --fail-on none 2>/dev/null | grep -m1 -oE '"direct":[0-9]+' | cut -d: -f2)" 0
 ht=$(timeout 60 heaptrack --record-only -o "$PWD/$w/ht" build/c_leak 2>&1 | grep -oE "leaked allocations:[[:space:]]*[0-9]+" | grep -oE "[0-9]+$" || true)
 expect c_leak heaptrack_leaked_allocs "$ht" 101
 has c_leak "lose c_leak.c:3"
@@ -426,6 +428,7 @@ rc=0; ./heaptide diff "$w/c_diff" "$w/c_diff" > "$w/diff_self.txt" 2>&1 || rc=$?
 expect diff self_exit "$rc $(wc -c < "$w/diff_self.txt")" "0 0"
 rc=0; ./heaptide diff "$w/c_diff" "$w/c_diff_b" --fail-on none >/dev/null 2>&1 || rc=$?
 expect diff none_exit "$rc" 0
+for x in "--fail-on" "--fail-on bad" "--top" "--bogus"; do rc=0; ./heaptide diff "$w/c_diff" "$w/c_diff_b" $x >/dev/null 2>&1 || rc=$?; expect diff "bad_args[$x]" "$rc" 2; done
 HEAPTIDE_SYMBOLIZER=/nonexistent ./heaptide diff "$w/c_diff" "$w/c_diff_b" 2> "$w/diff_nosym.err" >/dev/null || true
 grep -q "warning: unnamed frames" "$w/diff_nosym.err" && ok "diff warns without names" || bad diff "no warning without llvm-symbolizer ($w/diff_nosym.err)"
 expect diff json "$(./heaptide diff "$w/c_diff" "$w/c_diff_b" --json 2>/dev/null | python3 -c 'import json,sys;print(sorted(c["group"] for c in json.load(sys.stdin)["changes"]))' 2>&1 || true)" "['GROWN', 'NEW']"
@@ -594,6 +597,8 @@ print(re.sub(r"data\[\d\]", "data[i]", c[0]) if c else "none")' 2>&1)" "bytearra
   expect py_cap exit "$rc" 0
   has py_cap "WARN untracked:"
   has py_cap "capped at 1 MiB"
+  # interpreter options before -c stay the interpreter's, not a script name
+  expect py_opts out "$(./heaptide run --py --out "$w/py_opts" -- python3 -u -X dev -c 'print("TARGET_OK")' 2>/dev/null)" TARGET_OK
   # --py keeps its PYTHON section on SIGTERM and next to a snapshot
   rm -rf "$w/py_snap" "$w/py_term"
   ./heaptide run --py --out "$w/py_snap" -- python3 tests/py_hold.py >"$w/py_snap.out" 2>/dev/null & p=$!
